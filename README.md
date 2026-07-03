@@ -135,8 +135,10 @@ Feature codes:
 | `NOD` | HarnessingTS node chain. |
 | `KGR` | File-backed reference knowledge graph and graph-backed `query_knowledge`. |
 | `RQA` | Direct reference QA agent over `references/**`; mutually exclusive with `KGR`. |
+| `FQA` | QA over generated `tools/reference-feature-extractor/**` source/rules as replacement reference material; mutually exclusive with `KGR` and `RQA`. |
 | `KTL` | `knowledge-to-tools` node and validated reference feature extractor. |
 | `CRV` | Structured case review and case-level attribution. |
+| `CXR` | Structured case review with reference feature extractor execution disabled. |
 | `SUB` | Independent `Task` subagents for candidate testing/review. |
 | `ADA` | Adaptive iterative solving and stop decisions. |
 | `DIR` | Direct single-agent baseline; cannot be combined with other codes. |
@@ -151,6 +153,7 @@ Registered profiles:
 | `NOD-RQA-CRV-SUB-ADA` | `V3` | Direct reference QA with `knowledge-to-tools` and reference feature extractor removed. |
 | `NOD-RQA-SUB-ADA` | `V4` | Direct reference QA with both case review and knowledge tools removed. |
 | `DIR` | `V5` | Ordinary single-agent tool-use baseline with no node chain or harness MCP tools. |
+| `NOD-FQA-KTL-CXR-SUB-ADA` | `V6` | Builds the reference feature extractor, then uses its source/rules as downstream QA material; case review remains but extractor execution is disabled. |
 
 A removed feature is not merely optional. It is blocked by tool availability and backend checks where applicable. For example, no-`KTL` profiles cannot enter `knowledge-to-tools`, cannot validate or run the reference feature extractor, and do not expose extractor metadata through the API.
 
@@ -164,7 +167,7 @@ The server validates startup-only configuration before binding the port.
 | `Invalid TS_HARNESS_CONTROL_MODE` | Use `auto` or `manual`. |
 | `unknown feature code` | Run `uv run ts-harness variants` and choose a listed code. |
 | `DIR cannot be combined` | Use `DIR` alone. |
-| `KGR and RQA are mutually exclusive` | Choose either graph-backed knowledge or direct reference QA. |
+| `KGR, RQA, and FQA are mutually exclusive` | Choose graph-backed knowledge, direct reference QA, or extractor-source QA. |
 | `syntactically valid but not a registered ablation profile` | Use one of the registered canonical profiles. |
 
 ## Server Deployment

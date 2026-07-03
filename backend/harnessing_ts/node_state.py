@@ -134,6 +134,18 @@ class NodeStateMachine:
                 f"{self.variant.id} disables case review; remove case-review outputPaths "
                 "and do not generate reports/iterations/<iteration-id>-case-review.md."
             )
+        if self.variant.case_review and not self.variant.case_review_reference_features:
+            forbidden = [
+                path
+                for path in normalized
+                if "reference-feature" in path.casefold() or "reference_feature" in path.casefold()
+            ]
+            if forbidden:
+                raise RuntimeError(
+                    f"{self.variant.id} forbids executing or recording reference feature extractor usage "
+                    "during case review; remove these outputPaths: "
+                    + ", ".join(forbidden)
+                )
         missing = [
             label
             for label, pattern in requirements.items()

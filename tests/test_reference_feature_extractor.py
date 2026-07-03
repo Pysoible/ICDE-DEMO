@@ -123,11 +123,15 @@ def test_validates_executes_and_inspects_reference_feature_extractor(tmp_path) -
     _write_extractor(tmp_path)
 
     result = validate_reference_feature_extractor(tmp_path, run_tests=True)
+    static_result = validate_reference_feature_extractor(tmp_path, run_tests=False, allow_execution=False)
     output = execute_reference_feature_extractor(tmp_path, {"pr_ms": 220})
     module_output = execute_reference_feature_module(tmp_path, {"pr_ms": 220})
     inspected = inspect_reference_feature_extractor(tmp_path)
 
     assert result["ready"] is True
+    assert static_result["ready"] is True
+    assert static_result["executionAllowed"] is False
+    assert "testsPassed" not in static_result
     assert result["testsPassed"] == 1
     assert output["features"][0]["value"] == 220.0
     assert module_output == output
@@ -139,6 +143,29 @@ def test_validates_executes_and_inspects_reference_feature_extractor(tmp_path) -
     assert inspected["evaluationReport"]["controlCaseCount"] == 1
 
 
+def test_static_validation_does_not_import_or_execute_extractor_source(tmp_path) -> None:
+    _write_extractor(tmp_path)
+    source = tmp_path / "tools" / "reference-feature-extractor" / "extractor.py"
+    source.write_text(
+        """import json
+import sys
+
+raise RuntimeError("import-time execution should not run during static validation")
+
+def extract_features(case):
+    return {"schemaVersion": "1.0", "features": [], "warnings": []}
+""",
+        encoding="utf-8",
+    )
+
+    static_result = validate_reference_feature_extractor(tmp_path, run_tests=False, allow_execution=False)
+    assert static_result["ready"] is True
+    assert static_result["executionAllowed"] is False
+
+    with pytest.raises(RuntimeError, match="import-time execution"):
+        validate_reference_feature_extractor(tmp_path, run_tests=False, allow_execution=True)
+
+
 def test_rejects_non_deterministic_source(tmp_path) -> None:
     _write_extractor(tmp_path)
     source = tmp_path / "tools" / "reference-feature-extractor" / "extractor.py"
@@ -146,6 +173,13 @@ def test_rejects_non_deterministic_source(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="outside the deterministic allowlist"):
         validate_reference_feature_extractor(tmp_path)
+
+
+def test_static_validation_rejects_run_tests_without_execution(tmp_path) -> None:
+    _write_extractor(tmp_path)
+
+    with pytest.raises(RuntimeError, match="allow_execution=true"):
+        validate_reference_feature_extractor(tmp_path, run_tests=True, allow_execution=False)
 
 
 def test_rejects_test_cases_without_real_workspace_sample(tmp_path) -> None:

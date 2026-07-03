@@ -84,6 +84,32 @@ def test_rqa_main_runner_receives_reference_query_callback_without_graph(tmp_pat
     assert orchestrator._main_runner_knowledge_graph_ready is True
 
 
+def test_fqa_node_runner_does_not_receive_query_callback_before_source_ready(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TS_HARNESS_VARIANT", "NOD-FQA-KTL-CXR-SUB-ADA")
+    orchestrator = HarnessOrchestrator(tmp_path, dry_run=False)
+    orchestrator.initialize()
+    node = orchestrator.store.create_node_session("knowledge-to-tools")
+
+    with patch("harnessing_ts.orchestrator.build_node_runner", return_value=MagicMock()) as build:
+        orchestrator._spawn_node_runner(node)
+
+    assert build.call_args.kwargs["query_knowledge"] is None
+
+
+def test_fqa_node_runner_receives_query_callback_after_source_ready(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TS_HARNESS_VARIANT", "NOD-FQA-KTL-CXR-SUB-ADA")
+    orchestrator = HarnessOrchestrator(tmp_path, dry_run=False)
+    orchestrator.initialize()
+    node = orchestrator.store.create_node_session("iterative-solving")
+    orchestrator.store.write_reference_feature_status({"status": "completed"})
+
+    with patch.object(orchestrator.store, "is_reference_feature_extractor_ready", return_value=True):
+        with patch("harnessing_ts.orchestrator.build_node_runner", return_value=MagicMock()) as build:
+            orchestrator._spawn_node_runner(node)
+
+    assert build.call_args.kwargs["query_knowledge"] == orchestrator.request_query_knowledge
+
+
 def test_query_endpoint_rejects_unbuilt_graph_before_starting_reasoner(tmp_path) -> None:
     orchestrator = HarnessOrchestrator(tmp_path)
     orchestrator.initialize()

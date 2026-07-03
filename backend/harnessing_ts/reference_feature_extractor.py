@@ -66,7 +66,14 @@ def builder_build_prompt(*, task_files: list[str], references: list[str]) -> str
     )
 
 
-def validate_reference_feature_extractor(workspace_path: Path, *, run_tests: bool = False) -> dict[str, Any]:
+def validate_reference_feature_extractor(
+    workspace_path: Path,
+    *,
+    run_tests: bool = False,
+    allow_execution: bool = True,
+) -> dict[str, Any]:
+    if run_tests and not allow_execution:
+        raise RuntimeError("Reference feature extractor tests require allow_execution=true.")
     tool_dir = workspace_path / TOOL_DIR
     required = list(REFERENCE_FEATURE_ARTIFACT_PATHS)
     missing = [str(path) for path in required if not (workspace_path / path).is_file()]
@@ -132,7 +139,6 @@ def validate_reference_feature_extractor(workspace_path: Path, *, run_tests: boo
 
     source = (workspace_path / SOURCE_PATH).read_text(encoding="utf-8")
     _validate_deterministic_source(source)
-    _load_python_api(workspace_path, python_api)
     result = {
         "ready": True,
         "toolDir": str(TOOL_DIR),
@@ -145,7 +151,10 @@ def validate_reference_feature_extractor(workspace_path: Path, *, run_tests: boo
         "featureCount": len(features),
         "features": [str(item.get("name")) for item in features],
         "pythonApi": python_api,
+        "executionAllowed": allow_execution,
     }
+    if allow_execution:
+        _load_python_api(workspace_path, python_api)
     if run_tests:
         checked = 0
         for index, case in enumerate(tests):
@@ -444,6 +453,11 @@ def _validate_output(output: Any, manifest: dict[str, Any]) -> None:
 
 def inspect_reference_feature_extractor(workspace_path: Path) -> dict[str, Any]:
     summary = validate_reference_feature_extractor(workspace_path, run_tests=False)
+    return inspect_reference_feature_source(workspace_path, summary=summary)
+
+
+def inspect_reference_feature_source(workspace_path: Path, summary: dict[str, Any] | None = None) -> dict[str, Any]:
+    summary = summary or validate_reference_feature_extractor(workspace_path, run_tests=False, allow_execution=False)
     return {
         **summary,
         "manifest": read_json(workspace_path / MANIFEST_PATH),

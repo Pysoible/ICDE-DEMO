@@ -39,12 +39,15 @@ def build_main_allowed_tools(
 def build_node_allowed_tools(
     node_type: NodeType,
     *,
+    knowledge_query_ready: bool | None = None,
     reference_feature_extractor_ready: bool = False,
     variant: AblationVariant | None = None,
 ) -> list[str]:
     variant = variant or get_variant(DEFAULT_VARIANT_ID)
+    if knowledge_query_ready is None:
+        knowledge_query_ready = variant.knowledge_query
     pool = list(NODE_POOL)
-    if not variant.knowledge_query:
+    if not variant.knowledge_query or not knowledge_query_ready:
         pool.remove("mcp__ts_harness__query_knowledge")
     if not variant.reference_feature_extractor or not reference_feature_extractor_ready:
         pool = [tool for tool in pool if tool not in REFERENCE_FEATURE_TOOLS]

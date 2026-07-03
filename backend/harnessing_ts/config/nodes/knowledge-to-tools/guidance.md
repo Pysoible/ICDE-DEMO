@@ -4,7 +4,7 @@
 
 核心约束：
 - 所有判断必须落到 `user/problem-contract.md`、`user/data-spec.md` 与 `references/**` 的真实文本上。不得用 LLM 常识、模型默认或训练经验补充任何 feature、阈值、judgment 或 domain 规则；若这些材料没有给出当前 feature 的依据，必须把该 feature 标为 `indeterminate` 并把判定理由写入 README。
-- 若 `knowledgeQueryReady=true` 且系统注入了 `mcp__ts_harness__query_knowledge`，应通过该工具获取领域知识。`NOD-KGR-KTL-CRV-SUB-ADA` 中该工具查询知识图谱；`RQA` reference-QA 变体中该工具直接读取 `references/**`。不得把 `knowledge_base/tables/*.csv`、`knowledge_base/indexes/**` 或 `knowledge_base/cache/**` 当成普通读取入口直接消费。
+- 若 `knowledgeQueryReady=true` 且系统注入了 `mcp__ts_harness__query_knowledge`，应通过该工具获取领域知识。`NOD-KGR-KTL-CRV-SUB-ADA` 中该工具查询知识图谱；`RQA` reference-QA 变体中该工具直接读取 `references/**`；`FQA` extractor-source 变体中该工具只会在 extractor source 已静态校验后读取 `tools/reference-feature-extractor/**`。不得把 `knowledge_base/tables/*.csv`、`knowledge_base/indexes/**` 或 `knowledge_base/cache/**` 当成普通读取入口直接消费。
 - 若知识图谱尚未构建或不可用，主会话可结合 `references/**` 文本与自身对任务领域的常识，定义 reference 规则；但 evidence 必须仍指向 `references/**` 中的具体原文（路径、章节/页码与短引用），不得伪造引用。
 - 生成的 extractor 必须是纯确定性的：禁止网络、LLM、随机数、系统时间、外部进程、训练、在线拟合或隐式可变状态。相同 JSON 输入必须产生字节级一致的 JSON 输出。
 - extractor.py 必须暴露一个可 import 的纯函数 API，例如 `extract_features(case)`；函数名必须写入 `manifest.json` 的 `pythonApi`，并在 `README.md` 中给出直接 import/调用示例。文件也必须保留 CLI 包装：从 stdin 读取一个 JSON 值，只向 stdout 写一个 JSON 对象；错误写 stderr 并以非零状态退出。

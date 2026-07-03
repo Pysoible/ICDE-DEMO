@@ -103,6 +103,7 @@ def build_node_runner(
         attachment_text=build_node_attachment(node_type, node.get("inputSummary")),
         allowed_tools=build_node_allowed_tools(
             node_type,
+            knowledge_query_ready=query_knowledge is not None,
             reference_feature_extractor_ready=extract_reference_features is not None,
             variant=variant,
         ),

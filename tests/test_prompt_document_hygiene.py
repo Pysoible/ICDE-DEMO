@@ -119,6 +119,7 @@ def test_main_prompt_gates_knowledge_query_by_source_and_readiness() -> None:
     assert "`knowledgeQueryReady` 为 true" in role
     assert "`knowledgeQuerySource` 为 `graph`" in role
     assert "`knowledgeQuerySource` 为 `references`" in role
+    assert "`knowledgeQuerySource` 为 `extractor_source`" in role
 
 
 def test_final_summary_prompt_does_not_request_impossible_failure_reroute() -> None:

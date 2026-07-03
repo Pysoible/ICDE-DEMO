@@ -12,13 +12,15 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
     "NOD": "HarnessingTS node chain",
     "KGR": "file-backed reference knowledge graph",
     "RQA": "direct reference QA agent over references/**",
+    "FQA": "reference feature extractor source QA",
     "KTL": "knowledge-to-tools node and reference feature extractor",
     "CRV": "case-level review and attribution",
+    "CXR": "case-level review without executing the reference feature extractor",
     "SUB": "independent Task subagents",
     "ADA": "adaptive iterative solving",
     "DIR": "direct single-agent tool-use baseline",
 }
-FEATURE_ORDER = ("NOD", "KGR", "RQA", "KTL", "CRV", "SUB", "ADA")
+FEATURE_ORDER = ("NOD", "KGR", "RQA", "FQA", "KTL", "CRV", "CXR", "SUB", "ADA")
 DIRECT_FEATURE = "DIR"
 DEFAULT_VARIANT_ID = "NOD-KGR-KTL-CRV-SUB-ADA"
 LEGACY_ALIASES: dict[str, str] = {
@@ -28,6 +30,7 @@ LEGACY_ALIASES: dict[str, str] = {
     "V3": "NOD-RQA-CRV-SUB-ADA",
     "V4": "NOD-RQA-SUB-ADA",
     "V5": DIRECT_FEATURE,
+    "V6": "NOD-FQA-KTL-CXR-SUB-ADA",
 }
 
 
@@ -43,8 +46,10 @@ class AblationVariant:
     knowledge_query_source: str = "graph"
     reference_knowledge: bool = True
     knowledge_to_tools: bool = True
+    reference_feature_execution: bool = True
     independent_subagents: bool = True
     case_review: bool = True
+    case_review_reference_features: bool = True
     max_iterations: int | None = None
     main_prompt: str | None = None
     node_prompts: dict[str, str] = field(default_factory=dict)
@@ -56,10 +61,17 @@ class AblationVariant:
 
     @property
     def reference_feature_extractor(self) -> bool:
-        """The reference feature extractor is available iff the
-        `knowledge-to-tools` node runs and produces a validated tool.
-        Variants that disable the node propagate from
-        `knowledge_to_tools`."""
+        """Whether later sessions may execute the generated extractor.
+
+        Some variants still build the extractor but treat its source and
+        rule files as replacement reference material. Those variants keep
+        `knowledge_to_tools` enabled while disabling executable extractor
+        access.
+        """
+        return self.knowledge_to_tools and self.reference_feature_execution
+
+    @property
+    def reference_feature_source(self) -> bool:
         return self.knowledge_to_tools
 
     def prompt_overlay(self, scope: str) -> str:
@@ -82,8 +94,11 @@ class AblationVariant:
                 "referenceKnowledge": self.reference_knowledge,
                 "knowledgeToTools": self.knowledge_to_tools,
                 "referenceFeatureExtractor": self.reference_feature_extractor,
+                "referenceFeatureSource": self.reference_feature_source,
+                "referenceFeatureExecution": self.reference_feature_execution,
                 "independentSubagents": self.independent_subagents,
                 "caseReview": self.case_review,
+                "caseReviewReferenceFeatures": self.case_review_reference_features,
                 "maxIterations": self.max_iterations,
                 "directMainToolUse": self.direct_main_tool_use,
             },
@@ -169,11 +184,18 @@ def _validate_feature_combination(value: str, features: set[str]) -> None:
         return
     if "NOD" not in features:
         raise RuntimeError(f"Invalid TS_HARNESS_VARIANT={value!r}; non-DIR variants must include NOD.")
-    if {"KGR", "RQA"} <= features:
-        raise RuntimeError(f"Invalid TS_HARNESS_VARIANT={value!r}; KGR and RQA are mutually exclusive.")
-    if not ({"KGR", "RQA"} & features):
-        raise RuntimeError(f"Invalid TS_HARNESS_VARIANT={value!r}; NOD variants must include exactly one of KGR or RQA.")
-    node_only = {"KTL", "CRV", "SUB", "ADA"}
+    knowledge_sources = {"KGR", "RQA", "FQA"} & features
+    if len(knowledge_sources) > 1:
+        raise RuntimeError(f"Invalid TS_HARNESS_VARIANT={value!r}; KGR, RQA, and FQA are mutually exclusive.")
+    if not knowledge_sources:
+        raise RuntimeError(f"Invalid TS_HARNESS_VARIANT={value!r}; NOD variants must include exactly one of KGR, RQA, or FQA.")
+    if "FQA" in features and "KTL" not in features:
+        raise RuntimeError(f"Invalid TS_HARNESS_VARIANT={value!r}; FQA requires KTL so extractor source exists.")
+    if {"CRV", "CXR"} <= features:
+        raise RuntimeError(f"Invalid TS_HARNESS_VARIANT={value!r}; CRV and CXR are mutually exclusive.")
+    if "CXR" in features and "KTL" not in features:
+        raise RuntimeError(f"Invalid TS_HARNESS_VARIANT={value!r}; CXR requires KTL so there is an extractor to prohibit executing.")
+    node_only = {"KTL", "CRV", "CXR", "SUB", "ADA"}
     if node_only & features and "NOD" not in features:
         raise RuntimeError(
             f"Invalid TS_HARNESS_VARIANT={value!r}; {', '.join(sorted(node_only & features))} require NOD."
@@ -195,12 +217,14 @@ def _variant(
         features=features,
         node_chain="NOD" in features,
         knowledge_graph="KGR" in features,
-        knowledge_query=("KGR" in features or "RQA" in features),
-        knowledge_query_source="graph" if "KGR" in features else ("references" if "RQA" in features else "none"),
+        knowledge_query=("KGR" in features or "RQA" in features or "FQA" in features),
+        knowledge_query_source="graph" if "KGR" in features else ("references" if "RQA" in features else ("extractor_source" if "FQA" in features else "none")),
         reference_knowledge=("NOD" in features and "DIR" not in features),
         knowledge_to_tools="KTL" in features,
+        reference_feature_execution=("KTL" in features and "FQA" not in features),
         independent_subagents="SUB" in features,
-        case_review="CRV" in features,
+        case_review=("CRV" in features or "CXR" in features),
+        case_review_reference_features=("CRV" in features),
         **kwargs,
     )
 
@@ -273,6 +297,26 @@ VARIANTS: dict[str, AblationVariant] = {
         description="One ordinary coding-agent session with data, code, and tool access; no node chain, knowledge query agent, knowledge graph, candidate subagents, structured case review, or iteration state.",
         main_prompt="direct-agent-main.md",
     ),
+    "NOD-FQA-KTL-CXR-SUB-ADA": _variant(
+        "NOD-FQA-KTL-CXR-SUB-ADA",
+        name="Extractor Source QA + No Extractor Execution Case Review",
+        description=(
+            "Builds the reference feature extractor from references, then treats the generated extractor source, "
+            "rules, manifest, and README as the only downstream reference material. Downstream nodes may not query "
+            "original references or a knowledge graph, and case review may not execute the extractor."
+        ),
+        node_prompts={
+            "problem-contract": "fqa-problem-contract.md",
+            "knowledge-to-tools": "fqa-knowledge-to-tools.md",
+            "iterative-solving": "fqa-no-extractor-execution-iterative.md",
+            "final-summary": "fqa-no-extractor-execution-final.md",
+        },
+        node_purposes={
+            "problem-contract": "依据用户需求、references 原文和数据 exploration 建立 problem contract 与 data spec；不构建知识图谱。",
+            "knowledge-to-tools": "根据 references 原文构建静态校验通过的 deterministic reference feature extractor；该程序后续只作为参考材料，不作为可执行特征工具。",
+            "iterative-solving": "领域知识只能通过 extractor-source QA 获取；保留 case review，但 case review 禁止执行 reference feature extractor。",
+        },
+    ),
 }
 
 
@@ -344,7 +388,9 @@ def variant_help_text() -> str:
         "Rules:",
         "  - Order does not matter; the server records the canonical order.",
         "  - DIR cannot be combined with other codes.",
-        "  - KGR and RQA are mutually exclusive.",
-        "  - Non-DIR profiles must include NOD and exactly one of KGR or RQA.",
+        "  - KGR, RQA, and FQA are mutually exclusive.",
+        "  - Non-DIR profiles must include NOD and exactly one of KGR, RQA, or FQA.",
+        "  - FQA requires KTL because extractor source must be built before it can be queried.",
+        "  - CRV and CXR are mutually exclusive; CXR keeps case review but disables reference extractor execution.",
         "  - Syntactically valid but unregistered combinations fail fast.",
     ])

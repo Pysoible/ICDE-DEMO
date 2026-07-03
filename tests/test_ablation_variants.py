@@ -16,19 +16,21 @@ RQA_FULL = "NOD-RQA-KTL-CRV-SUB-ADA"
 RQA_NO_CASE = "NOD-RQA-KTL-SUB-ADA"
 RQA_NO_TOOLS = "NOD-RQA-CRV-SUB-ADA"
 RQA_NO_CASE_NO_TOOLS = "NOD-RQA-SUB-ADA"
+FQA_NO_EXEC_CASE = "NOD-FQA-KTL-CXR-SUB-ADA"
 DIRECT = "DIR"
 
 
 def test_variant_registry_exposes_feature_code_profiles_and_legacy_aliases(monkeypatch) -> None:
     monkeypatch.delenv("TS_HARNESS_VARIANT", raising=False)
     assert resolve_variant().id == FULL
-    assert [get_variant(f"v{index}").id for index in range(6)] == [
+    assert [get_variant(f"v{index}").id for index in range(7)] == [
         FULL,
         RQA_FULL,
         RQA_NO_CASE,
         RQA_NO_TOOLS,
         RQA_NO_CASE_NO_TOOLS,
         DIRECT,
+        FQA_NO_EXEC_CASE,
     ]
     assert get_variant("RQA-NOD-KTL-SUB-ADA").id == RQA_NO_CASE
     assert canonical_variant_id("ADA-SUB-KTL-RQA-NOD") == RQA_NO_CASE
@@ -39,6 +41,10 @@ def test_variant_registry_exposes_feature_code_profiles_and_legacy_aliases(monke
         get_variant("DIR-NOD")
     with pytest.raises(RuntimeError, match="mutually exclusive"):
         get_variant("NOD-KGR-RQA")
+    with pytest.raises(RuntimeError, match="mutually exclusive"):
+        get_variant("NOD-FQA-RQA-KTL")
+    with pytest.raises(RuntimeError, match="FQA requires KTL"):
+        get_variant("NOD-FQA-CXR-SUB-ADA")
     with pytest.raises(RuntimeError, match="syntactically valid but not a registered"):
         get_variant("NOD-RQA")
 
@@ -50,6 +56,7 @@ def test_rebuilt_variant_capabilities_match_ablation_table() -> None:
     v3 = get_variant(RQA_NO_TOOLS)
     v4 = get_variant(RQA_NO_CASE_NO_TOOLS)
     v5 = get_variant(DIRECT)
+    v6 = get_variant(FQA_NO_EXEC_CASE)
 
     assert v0.knowledge_graph is True
     assert v0.knowledge_query_source == "graph"
@@ -68,15 +75,28 @@ def test_rebuilt_variant_capabilities_match_ablation_table() -> None:
 
     assert v3.knowledge_query_source == "references"
     assert v3.knowledge_to_tools is False
+    assert v3.reference_feature_execution is False
     assert v3.case_review is True
 
     assert v4.knowledge_query_source == "references"
     assert v4.knowledge_to_tools is False
+    assert v4.reference_feature_execution is False
     assert v4.case_review is False
 
     assert v5.node_chain is False
     assert v5.knowledge_query is False
+    assert v5.reference_feature_execution is False
     assert v5.direct_main_tool_use is True
+
+    assert v6.knowledge_graph is False
+    assert v6.knowledge_query is True
+    assert v6.knowledge_query_source == "extractor_source"
+    assert v6.knowledge_to_tools is True
+    assert v6.reference_feature_source is True
+    assert v6.reference_feature_extractor is False
+    assert v6.reference_feature_execution is False
+    assert v6.case_review is True
+    assert v6.case_review_reference_features is False
 
 
 def test_variant_capabilities_change_actual_tool_permissions() -> None:
@@ -89,6 +109,16 @@ def test_variant_capabilities_change_actual_tool_permissions() -> None:
     assert "mcp__ts_harness__validate_reference_feature_extractor" not in build_main_allowed_tools(variant=get_variant(RQA_NO_TOOLS))
     assert "mcp__ts_harness__enter_node" not in build_main_allowed_tools(variant=get_variant(DIRECT))
     assert "Bash" in build_main_allowed_tools(variant=get_variant(DIRECT))
+    assert "mcp__ts_harness__validate_reference_feature_extractor" in build_main_allowed_tools(variant=get_variant(FQA_NO_EXEC_CASE))
+    assert "mcp__ts_harness__extract_reference_features" not in build_main_allowed_tools(
+        reference_feature_extractor_ready=True,
+        variant=get_variant(FQA_NO_EXEC_CASE),
+    )
+    assert "mcp__ts_harness__inspect_reference_feature_extractor" not in build_node_allowed_tools(
+        "iterative-solving",
+        reference_feature_extractor_ready=True,
+        variant=get_variant(FQA_NO_EXEC_CASE),
+    )
 
 
 def test_variant_prompt_overlays_are_composed_without_changing_full_profile() -> None:
@@ -98,6 +128,7 @@ def test_variant_prompt_overlays_are_composed_without_changing_full_profile() ->
     v2_node = build_node_system_prompt("iterative-solving", context, get_variant(RQA_NO_CASE))
     v3_node = build_node_system_prompt("iterative-solving", context, get_variant(RQA_NO_TOOLS))
     v5_main = build_main_system_prompt(context, get_variant(DIRECT))
+    v6_node = build_node_system_prompt("iterative-solving", context, get_variant(FQA_NO_EXEC_CASE))
 
     assert "## Node Chain" in v0_main
     assert "direct reference QA" in v1_node
@@ -105,6 +136,7 @@ def test_variant_prompt_overlays_are_composed_without_changing_full_profile() ->
     assert "No Knowledge Graph + No Knowledge Tools" in v3_node
     assert "## Node Chain" not in v5_main
     assert "Single-Agent Tool Use" in v5_main
+    assert "Extractor Source QA + No Extractor Execution" in v6_node
 
 
 def test_no_case_review_variants_remove_only_case_review_finish_artifact(tmp_path) -> None:
@@ -222,3 +254,66 @@ def test_full_variant_routes_problem_contract_to_knowledge_to_tools(tmp_path) ->
         "goalMet": False,
     }
     assert state.next_node_after_completion(node) == "knowledge-to-tools"
+
+
+def test_fqa_variant_uses_extractor_source_query_and_static_validation(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TS_HARNESS_VARIANT", FQA_NO_EXEC_CASE)
+    from harnessing_ts.orchestrator import HarnessOrchestrator
+
+    orchestrator = HarnessOrchestrator(tmp_path, dry_run=False)
+    orchestrator.initialize()
+
+    assert orchestrator.get_variant()["capabilities"]["referenceFeatureExecution"] is False
+    assert orchestrator.get_variant()["capabilities"]["referenceFeatureExtractor"] is False
+    assert orchestrator.get_variant()["capabilities"]["referenceFeatureSource"] is True
+    assert orchestrator._main_progress_snapshot()["knowledgeQuerySource"] == "extractor_source"
+    assert orchestrator._main_progress_snapshot()["knowledgeQueryReady"] is False
+
+    with pytest.raises(RuntimeError, match="source is not ready"):
+        asyncio.run(orchestrator.query_knowledge("What rules exist?"))
+
+    with patch(
+        "harnessing_ts.orchestrator.answer_extractor_source_query",
+        new=AsyncMock(return_value={"answer": "from extractor source"}),
+    ) as query:
+        orchestrator.store.write_reference_feature_status({"status": "completed"})
+        with patch.object(orchestrator.store, "is_reference_feature_extractor_ready", return_value=True):
+            assert asyncio.run(orchestrator.query_knowledge("What rules exist?"))["answer"] == "from extractor source"
+    query.assert_awaited_once()
+
+
+def test_fqa_variant_rejects_executable_reference_feature_tools(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TS_HARNESS_VARIANT", FQA_NO_EXEC_CASE)
+    from harnessing_ts.orchestrator import HarnessOrchestrator
+
+    orchestrator = HarnessOrchestrator(tmp_path, dry_run=False)
+    orchestrator.initialize()
+
+    with pytest.raises(RuntimeError, match=f"disabled by ablation variant {FQA_NO_EXEC_CASE}"):
+        orchestrator.request_extract_reference_features({"input": {"case": "x"}})
+    with pytest.raises(RuntimeError, match=f"disabled by ablation variant {FQA_NO_EXEC_CASE}"):
+        orchestrator.request_inspect_reference_feature_extractor({})
+    assert orchestrator.get_reference_feature_tool() == {}
+
+
+def test_fqa_case_review_keeps_case_review_but_rejects_reference_feature_usage(tmp_path) -> None:
+    state = NodeStateMachine(tmp_path, get_variant(FQA_NO_EXEC_CASE))
+    valid_paths = [
+        "reports/iterations/001-candidate-review.md",
+        "reports/iterations/001-case-review.md",
+        "reports/iterations/001-summary.md",
+        "user/iteration-state.md",
+    ]
+    state.validate_iterative_output_paths(valid_paths)
+    with pytest.raises(RuntimeError, match="forbids executing or recording reference feature"):
+        state.validate_iterative_output_paths([*valid_paths, "runs/iterations/001/reference-feature-usage.json"])
+
+
+def test_no_case_review_variant_does_not_treat_reference_feature_usage_as_cxr(tmp_path) -> None:
+    state = NodeStateMachine(tmp_path, get_variant(RQA_NO_CASE))
+    state.validate_iterative_output_paths([
+        "reports/iterations/001-candidate-review.md",
+        "reports/iterations/001-summary.md",
+        "runs/iterations/001/reference-feature-usage.json",
+        "user/iteration-state.md",
+    ])

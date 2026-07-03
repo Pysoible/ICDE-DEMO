@@ -142,8 +142,8 @@ The MCP server exposes structured harness tools while leaving methodology in Mar
 - `record_artifact`
 - `record_run`
 - `get_runtime_settings`
-- `query_knowledge` when the active variant allows it; `KGR` profiles use the built knowledge graph, while `RQA` reference-QA profiles answer directly from `references/**`
-- reference feature extractor validation/inspection/execution tools when the active variant allows `knowledge-to-tools`
+- `query_knowledge` when the active variant allows it; `KGR` profiles use the built knowledge graph, `RQA` reference-QA profiles answer directly from `references/**`, and `FQA` extractor-source profiles answer from generated `tools/reference-feature-extractor/**` source/rules after static validation.
+- reference feature extractor validation/inspection/execution tools when the active variant allows `knowledge-to-tools` and executable extractor use. Some `FQA` profiles still build the extractor but expose it only as static reference material, not as an executable case-review tool.
 
 MCP should not decide which ECG feature, classifier, or LLM judgment strategy is appropriate. It records or mutates harness state, exposes runtime settings, and provides deterministic access to already-built knowledge and reference-feature services.
 

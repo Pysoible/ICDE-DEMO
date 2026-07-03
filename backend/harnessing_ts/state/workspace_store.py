@@ -208,16 +208,21 @@ class WorkspaceStore:
         write_json(self.reference_feature_status_path, current)
         return current
 
-    def is_reference_feature_extractor_ready(self) -> bool:
+    def is_reference_feature_extractor_ready(self, *, allow_execution: bool = True) -> bool:
         if self.read_reference_feature_status().get("status") != "completed":
             return False
         try:
             from harnessing_ts.reference_feature_extractor import validate_reference_feature_extractor
-            return bool(validate_reference_feature_extractor(self.root).get("ready"))
+            return bool(validate_reference_feature_extractor(self.root, allow_execution=allow_execution).get("ready"))
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
             return False
 
-    def validate_and_store_reference_feature(self, *, run_tests: bool = True) -> dict[str, Any]:
+    def validate_and_store_reference_feature(
+        self,
+        *,
+        run_tests: bool = True,
+        allow_execution: bool = True,
+    ) -> dict[str, Any]:
         """Run the deterministic validator on the on-disk extractor
         artifacts, update the persisted status, and return the validation
         summary. Raises on hard validation failure; the caller can decide
@@ -227,7 +232,11 @@ class WorkspaceStore:
 
         ts = now_iso()
         try:
-            summary = validate_reference_feature_extractor(self.root, run_tests=run_tests)
+            summary = validate_reference_feature_extractor(
+                self.root,
+                run_tests=run_tests,
+                allow_execution=allow_execution,
+            )
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
             self.write_reference_feature_status({
                 "running": False,
@@ -245,7 +254,11 @@ class WorkspaceStore:
             "running": False,
             "status": "completed",
             "finishedAt": ts,
-            "message": "Reference feature extractor validated.",
+            "message": (
+                "Reference feature extractor validated for execution."
+                if allow_execution
+                else "Reference feature extractor source validated for reference-only use."
+            ),
             **summary,
         }
         write_json(self.reference_feature_status_path, status)

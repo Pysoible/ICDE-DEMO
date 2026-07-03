@@ -13,6 +13,7 @@ from urllib.parse import quote
 
 from harnessing_ts.agent.sdk_runner import SdkRunner, SdkRunnerConfig
 from harnessing_ts.knowledge_prompts import REASONER_SYSTEM_PROMPT, REFERENCE_REASONER_SYSTEM_PROMPT, builder_system_prompt, knowledge_graph_prompt
+from harnessing_ts.reference_feature_extractor import inspect_reference_feature_source
 from harnessing_ts.schema import Part
 from harnessing_ts.settings.llm import LlmConfig, build_sdk_invocation_config
 from harnessing_ts.state.message_log import MessageLog
@@ -225,6 +226,82 @@ async def answer_reference_query(
     else:
         parsed = _compact_knowledge_query_answer(parsed)
     parsed["knowledge_source"] = "references"
+    return parsed
+
+
+async def answer_extractor_source_query(
+    *,
+    workspace_path: Path,
+    store: WorkspaceStore,
+    llm_config: LlmConfig,
+    question: str,
+    domain: str | None = None,
+    context: dict[str, Any] | None = None,
+    observations: list[str] | None = None,
+    include_evidence: bool = False,
+) -> dict[str, Any]:
+    sdk_config = build_sdk_invocation_config(llm_config)
+    if llm_config.authMode == "manual" and not llm_config.apiKey:
+        raise RuntimeError("Extractor-source reasoning LLM config requires apiKey when authMode=manual.")
+    source = inspect_reference_feature_source(workspace_path)
+    source_payload = {
+        "manifest": source.get("manifest"),
+        "referenceRules": source.get("referenceRules"),
+        "evidenceMap": source.get("evidenceMap"),
+        "featurePlan": source.get("featurePlan"),
+        "evaluationReport": source.get("evaluationReport"),
+        "readme": source.get("readme"),
+        "source": source.get("source"),
+    }
+    prompt = "\n".join([
+        "请只根据已生成的 `tools/reference-feature-extractor/**` 源码、规则、manifest、README 和评估报告回答问题。",
+        "这些文件在当前变体中替代原始 reference materials。不要使用 `references/**`、knowledge graph、knowledge_base CSV、class、relation 或 graph edges。",
+        "不要执行、import、调用或推演运行 extractor.py；只能把源码和规则文本作为静态参考材料解读。",
+        "若 extractor source 中没有足够信息，必须明确 uncertainty，不要补充无来源规则。",
+        "",
+        f"Domain: {domain or 'default'}",
+        f"Question: {question}",
+        f"Context: {json.dumps(context or {}, ensure_ascii=False)}",
+        f"Observations: {json.dumps(observations or [], ensure_ascii=False)}",
+        f"Include evidence details: {json.dumps(include_evidence)}",
+        "",
+        "Extractor source bundle:",
+        json.dumps(source_payload, ensure_ascii=False, indent=2),
+        "",
+        "输出 JSON：",
+        "{",
+        '  "answer": "自然语言回答",',
+        '  "candidate_targets": ["候选概念、规则或源码中定义的判断目标"],',
+        '  "supporting_knowledge": ["extractor source/rules/README 中的依据摘要"],',
+        '  "supporting_evidence": [],',
+        '  "related_graph_edges": [],',
+        '  "recommended_next_checks": ["..."],',
+        '  "uncertainty": "..."',
+        "}",
+        "",
+        "只有 Include evidence details 为 true 时，supporting_evidence 才应包含必要的短引用、字段路径或文件路径；否则保持空数组或省略。",
+        "只输出合法 JSON，不要输出 Markdown fence。",
+    ])
+    runner = SdkRunner(SdkRunnerConfig(
+        cwd=workspace_path,
+        system_prompt=REFERENCE_REASONER_SYSTEM_PROMPT,
+        attachment_text=None,
+        allowed_tools=[],
+        model=sdk_config.model,
+        env=sdk_config.env,
+        extra_args=sdk_config.extra_args,
+        log=MessageLog(store.knowledge_reasoning_log_path),
+    ))
+    try:
+        parts = await runner.send_with_user_echo(prompt)
+    finally:
+        await runner.close()
+    parsed = _parse_json_answer(_last_assistant_text(parts))
+    if include_evidence:
+        parsed.setdefault("retrieval", {"source": "extractor_source"})
+    else:
+        parsed = _compact_knowledge_query_answer(parsed)
+    parsed["knowledge_source"] = "extractor_source"
     return parsed
 
 

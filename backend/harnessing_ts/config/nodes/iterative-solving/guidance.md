@@ -12,7 +12,7 @@
 必须完成：
 - 读取 `user/problem-contract.md`，严格围绕 contract 的目标、输入输出、评价方式和停止条件工作。
 - 读取 `user/data-spec.md`，所有工具构建、训练、推理、评估、case review 和输出预测文件都必须遵守其中定义的数据路径等要求。
-- 若系统注入了 `mcp__ts_harness__query_knowledge`，**必须调用该工具**获取领域知识（如 ECG 异常类型定义、信号特征、常见方法、评价指标、bad case 归因线索等）。`NOD-KGR-KTL-CRV-SUB-ADA` 中该工具查询 reference knowledge graph；`RQA` reference-QA 变体中该工具直接读取 `references/**`。候选生成、case review 归因和 iteration summary 阶段都应按自然语言问题查询。
+- 若系统注入了 `mcp__ts_harness__query_knowledge`，**必须调用该工具**获取领域知识（如 ECG 异常类型定义、信号特征、常见方法、评价指标、bad case 归因线索等）。`NOD-KGR-KTL-CRV-SUB-ADA` 中该工具查询 reference knowledge graph；`RQA` reference-QA 变体中该工具直接读取 `references/**`；`FQA` extractor-source 变体中该工具只读取 `tools/reference-feature-extractor/**` 的静态源码、规则、manifest 和 README。候选生成、case review 归因和 iteration summary 阶段都应按自然语言问题查询。
 - 普通知识检索不要直接读取 `knowledge_base/tables/*.csv`、`knowledge_base/indexes/**` 或 `knowledge_base/cache/**`。这些文件是 knowledge graph builder/reasoner 的内部存储；只有用户明确要求调试知识库文件、CSV schema 或图谱构建错误时才可以直接读取。
 - 调用 `mcp__ts_harness__query_knowledge` 时默认不要请求原文证据详情。只有用户明确要求 citations/evidence，或本轮 case review 必须审计原始 reference 证据时，才设置 `includeEvidence=true`。
 - 读取已有 `tools/**`、`reports/iterations/**` 和 `user/iteration-state.md`。首轮迭代时这些路径可以不存在；若不存在，应从 contract 和 data-spec 开始建立第一轮工具。

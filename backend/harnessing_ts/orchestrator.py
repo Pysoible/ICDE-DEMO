@@ -9,6 +9,7 @@ from harnessing_ts.agent.session_factory import build_main_runner, build_node_ru
 from harnessing_ts.agent.translate import system_text_part, user_text_part
 from harnessing_ts.chain_summary import build_chain_summary
 from harnessing_ts.knowledge_graph import (
+    answer_extractor_source_query,
     answer_knowledge_query,
     answer_reference_query,
     build_knowledge_graph,
@@ -350,11 +351,13 @@ class HarnessOrchestrator:
 
     def record_artifact(self, args: dict[str, Any]) -> dict[str, bool]:
         self._ensure_initialized()
+        self._reject_reference_feature_case_review_artifact(args.get("path"))
         self.store.record_artifact(args["path"], self.active_node_session.get("id") if self.active_node_session else None, self.active_node_session.get("nodeType") if self.active_node_session else None, args.get("summary"))
         return {"ok": True}
 
     def record_artifact_for_node(self, args: dict[str, Any], node_id: str, node_type: NodeType) -> dict[str, bool]:
         self._ensure_initialized()
+        self._reject_reference_feature_case_review_artifact(args.get("path"), node_type=node_type)
         node = self.store.read_node_session(node_id)
         event_type = "late_after_finish" if node and node.get("status") in {"completed", "failed", "exited"} else None
         summary = args.get("summary")
@@ -365,6 +368,7 @@ class HarnessOrchestrator:
 
     def record_run(self, args: RunRecord) -> dict[str, bool]:
         self._ensure_initialized()
+        self._reject_reference_feature_case_review_run(args, self.active_node_session.get("nodeType") if self.active_node_session else None)
         record = dict(args)
         if self.active_node_session:
             record.setdefault("nodeSessionId", self.active_node_session["id"])
@@ -374,6 +378,7 @@ class HarnessOrchestrator:
 
     def record_run_for_node(self, args: RunRecord, node_id: str, node_type: NodeType) -> dict[str, bool]:
         self._ensure_initialized()
+        self._reject_reference_feature_case_review_run(args, node_type)
         record = dict(args)
         record["nodeSessionId"] = node_id
         record["nodeType"] = node_type
@@ -388,6 +393,11 @@ class HarnessOrchestrator:
             raise RuntimeError(f"Knowledge queries are disabled by ablation variant {self.variant.id}.")
         if self.variant.knowledge_query_source == "graph" and not self.store.is_knowledge_graph_ready():
             raise RuntimeError("Knowledge graph is not ready. Build it successfully before calling query_knowledge.")
+        if (
+            self.variant.knowledge_query_source == "extractor_source"
+            and not self.store.is_reference_feature_extractor_ready(allow_execution=False)
+        ):
+            raise RuntimeError("Reference feature extractor source is not ready. Build and statically validate it first.")
         return await self.query_knowledge(
             question=str(args.get("question", "")),
             domain=args.get("domain"),
@@ -424,8 +434,12 @@ class HarnessOrchestrator:
         """
         if not self.variant.knowledge_to_tools:
             raise RuntimeError(f"Reference feature validation is disabled by ablation variant {self.variant.id}.")
-        run_tests = bool(args.get("runTests", True))
-        status = self.store.validate_and_store_reference_feature(run_tests=run_tests)
+        allow_execution = self.variant.reference_feature_execution
+        run_tests = bool(args.get("runTests", True)) and allow_execution
+        status = self.store.validate_and_store_reference_feature(
+            run_tests=run_tests,
+            allow_execution=allow_execution,
+        )
         await_refresh = self.main_runner is not None and not self.state.get("activeNode")
         # The new tool may have just been validated; refresh the main
         # runner when this is called from the main session. During a node
@@ -677,7 +691,7 @@ class HarnessOrchestrator:
 
     def get_reference_feature_status(self) -> dict[str, Any]:
         self._ensure_initialized()
-        if not self.variant.reference_feature_extractor:
+        if not self.variant.reference_feature_source:
             return {
                 "status": "disabled",
                 "ready": False,
@@ -686,14 +700,20 @@ class HarnessOrchestrator:
         status = self.store.read_reference_feature_status()
         if status.get("status") == "completed":
             try:
-                status = {**status, **validate_reference_feature_extractor(self.workspace_path)}
+                status = {
+                    **status,
+                    **validate_reference_feature_extractor(
+                        self.workspace_path,
+                        allow_execution=self.variant.reference_feature_execution,
+                    ),
+                }
             except (OSError, RuntimeError, ValueError) as exc:
                 status = {**status, "ready": False, "validationError": str(exc)}
         return status
 
     def get_reference_feature_parts(self) -> list[Part]:
         self._ensure_initialized()
-        if not self.variant.reference_feature_extractor:
+        if not self.variant.reference_feature_source:
             return []
         return self.store.read_reference_feature_parts()
 
@@ -725,6 +745,19 @@ class HarnessOrchestrator:
             raise RuntimeError("Knowledge graph is not ready. Build it successfully before querying knowledge.")
         if self.variant.knowledge_query_source == "references":
             result = await answer_reference_query(
+                workspace_path=self.workspace_path,
+                store=self.store,
+                llm_config=self._knowledge_graph_llm_config(),
+                question=question,
+                domain=domain,
+                context=context,
+                observations=observations,
+                include_evidence=include_evidence,
+            )
+        elif self.variant.knowledge_query_source == "extractor_source":
+            if not self.store.is_reference_feature_extractor_ready(allow_execution=False):
+                raise RuntimeError("Reference feature extractor source is not ready. Build and statically validate it first.")
+            result = await answer_extractor_source_query(
                 workspace_path=self.workspace_path,
                 store=self.store,
                 llm_config=self._knowledge_graph_llm_config(),
@@ -940,7 +973,10 @@ class HarnessOrchestrator:
         if not self.variant.knowledge_to_tools:
             raise RuntimeError(f"Reference feature extractor is disabled by ablation variant {self.variant.id}.")
         try:
-            status = self.store.validate_and_store_reference_feature(run_tests=True)
+            status = self.store.validate_and_store_reference_feature(
+                run_tests=self.variant.reference_feature_execution,
+                allow_execution=self.variant.reference_feature_execution,
+            )
             await self._refresh_main_runner_for_dynamic_tools()
             return {"ok": True, "status": status, "tool": self.get_reference_feature_tool()}
         except (OSError, RuntimeError, ValueError) as exc:
@@ -1578,6 +1614,33 @@ class HarnessOrchestrator:
         if not self.variant.knowledge_graph:
             raise RuntimeError(f"Knowledge graph access is disabled by ablation variant {self.variant.id}.")
 
+    def _reject_reference_feature_case_review_artifact(
+        self,
+        path: Any,
+        *,
+        node_type: NodeType | None = None,
+    ) -> None:
+        effective_node_type = node_type or (self.active_node_session.get("nodeType") if self.active_node_session else None)
+        if (
+            not self.variant.case_review
+            or self.variant.case_review_reference_features
+            or effective_node_type != "iterative-solving"
+        ):
+            return
+        text = str(path or "").casefold()
+        if "reference-feature" in text or "reference_feature" in text:
+            raise RuntimeError(
+                f"{self.variant.id} keeps case review but forbids executing or recording reference feature extractor usage."
+            )
+
+    def _reject_reference_feature_case_review_run(self, args: RunRecord, node_type: NodeType | None) -> None:
+        if not self.variant.case_review or self.variant.case_review_reference_features or node_type != "iterative-solving":
+            return
+        paths = [str(path) for path in args.get("artifactPaths", [])]
+        run_id = str(args.get("runId", ""))
+        for value in [run_id, *paths]:
+            self._reject_reference_feature_case_review_artifact(value, node_type=node_type)
+
     def _knowledge_query_ready(self) -> bool:
         if not self.variant.knowledge_query:
             return False
@@ -1585,6 +1648,8 @@ class HarnessOrchestrator:
             return self.store.is_knowledge_graph_ready()
         if self.variant.knowledge_query_source == "references":
             return True
+        if self.variant.knowledge_query_source == "extractor_source":
+            return self.store.is_reference_feature_extractor_ready(allow_execution=False)
         return False
 
     def _knowledge_graph_llm_config(self) -> LlmConfig:
@@ -1689,6 +1754,7 @@ class HarnessOrchestrator:
             "knowledgeQueryReady": self._knowledge_query_ready(),
             "knowledgeQuerySource": self.variant.knowledge_query_source if self.variant.knowledge_query else "none",
             "referenceFeatureExtractorReady": self.variant.reference_feature_extractor and self.store.is_reference_feature_extractor_ready(),
+            "referenceFeatureSourceReady": self.variant.reference_feature_source and self.store.is_reference_feature_extractor_ready(allow_execution=False),
             "recommendedAction": recommended_action,
             "recommendedNode": recommended_node,
             "routingReason": reason,
@@ -1743,7 +1809,7 @@ class HarnessOrchestrator:
             node=node,
             log_path=self.store.node_log_path(node_id),
             finish_node=lambda args: self.request_finish_node_for_node(args, node_id),
-            query_knowledge=self.request_query_knowledge if self.variant.knowledge_query else None,
+            query_knowledge=self.request_query_knowledge if self._knowledge_query_ready() else None,
             extract_reference_features=self.request_extract_reference_features if self.variant.reference_feature_extractor and self.store.is_reference_feature_extractor_ready() else None,
             inspect_reference_feature_extractor=self.request_inspect_reference_feature_extractor if self.variant.reference_feature_extractor and self.store.is_reference_feature_extractor_ready() else None,
             validate_reference_feature_extractor=self.request_validate_reference_feature_extractor if self.variant.knowledge_to_tools and node_type == "knowledge-to-tools" else None,
