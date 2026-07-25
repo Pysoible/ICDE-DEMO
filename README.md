@@ -1,6 +1,7 @@
-# HarnessingTS
+# RecursiveECG
 
-HarnessingTS is a time-series tool-use harness built on the Python Claude Code SDK. It helps an agent work through a time-series task with references, data exploration, a problem contract, iterative tool building, evidence review, and a final summary.
+RecursiveECG is a time-series tool-use harness built on the Python Claude Code SDK.
+It helps an agent work through a time-series task with references, data exploration, a problem contract, iterative tool building, evidence review, and a final summary.
 
 It is not a leaderboard or model-comparison framework. The goal is a structured, auditable problem-solving workflow.
 
@@ -35,8 +36,8 @@ export PATH="$BUN_INSTALL/bin:$PATH"
 ### 2. Prepare The Project
 
 ```bash
-git clone https://github.com/neumyor/RecursiveTime.git
-cd RecursiveTime
+git clone https://github.com/neumyor/RecursiveECG.git
+cd RecursiveECG
 
 uv sync
 uv run ts-harness setup-server
@@ -77,7 +78,7 @@ uv run ts-harness llm-config
 Use a separate workspace per experiment or ablation variant.
 
 ```bash
-export TS_HARNESS_WORKSPACE="$HOME/.harnessingts/workspaces/default"
+export TS_HARNESS_WORKSPACE="$HOME/.RecursiveECG/workspaces/default"
 export TS_HARNESS_VARIANT=NOD-KGR-KTL-CRV-SUB-ADA
 export TS_HARNESS_CONTROL_MODE=auto
 export HOST=127.0.0.1
@@ -132,7 +133,7 @@ Feature codes:
 
 | Code | Meaning |
 |---|---|
-| `NOD` | HarnessingTS node chain. |
+| `NOD` | RecursiveECG node chain. |
 | `KGR` | File-backed reference knowledge graph and graph-backed `query_knowledge`. |
 | `RQA` | Direct reference QA agent over `references/**`; mutually exclusive with `KGR`. |
 | `FQA` | QA over generated `tools/reference-feature-extractor/**` source/rules as replacement reference material; mutually exclusive with `KGR` and `RQA`. |
@@ -147,7 +148,7 @@ Registered profiles:
 
 | Canonical ID | Legacy alias | Description |
 |---|---|---|
-| `NOD-KGR-KTL-CRV-SUB-ADA` | `V0` | Full HarnessingTS. |
+| `NOD-KGR-KTL-CRV-SUB-ADA` | `V0` | Full RecursiveECG. |
 | `NOD-RQA-KTL-CRV-SUB-ADA` | `V1` | Full node workflow without the knowledge graph; `query_knowledge` answers directly from references. |
 | `NOD-RQA-KTL-SUB-ADA` | `V2` | Direct reference QA with case review removed. |
 | `NOD-RQA-CRV-SUB-ADA` | `V3` | Direct reference QA with `knowledge-to-tools` and reference feature extractor removed. |
@@ -177,7 +178,7 @@ For LAN or server use, bind to a non-loopback address and keep all startup-only 
 ```bash
 export HOST=0.0.0.0
 export PORT=4327
-export TS_HARNESS_WORKSPACE=/srv/harnessingts/workspaces/nod-kgr-ktl-crv-sub-ada
+export TS_HARNESS_WORKSPACE=/srv/RecursiveECG/workspaces/nod-kgr-ktl-crv-sub-ada
 export TS_HARNESS_VARIANT=NOD-KGR-KTL-CRV-SUB-ADA
 export TS_HARNESS_CONTROL_MODE=auto
 
@@ -189,7 +190,7 @@ One-line launch example:
 ```bash
 HOST=0.0.0.0 \
 PORT=4327 \
-TS_HARNESS_WORKSPACE=/srv/harnessingts/workspaces/nod-rqa-sub-ada \
+TS_HARNESS_WORKSPACE=/srv/RecursiveECG/workspaces/nod-rqa-sub-ada \
 TS_HARNESS_VARIANT=NOD-RQA-SUB-ADA \
 TS_HARNESS_CONTROL_MODE=auto \
 uv run ts-harness-server
@@ -202,14 +203,14 @@ For long-running deployments, use a process manager such as `systemd`, `supervis
 ```ini
 [Service]
 User=harness
-WorkingDirectory=/path/to/HarnessingTS
+WorkingDirectory=/path/to/RecursiveECG
 Environment=BUN_INSTALL=/home/harness/.bun
 Environment=PATH=/home/harness/.bun/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOST=0.0.0.0
 Environment=PORT=4327
-Environment=TS_HARNESS_WORKSPACE=/srv/harnessingts/workspaces/nod-kgr-ktl-crv-sub-ada
+Environment=TS_HARNESS_WORKSPACE=/srv/RecursiveECG/workspaces/nod-kgr-ktl-crv-sub-ada
 Environment=TS_HARNESS_VARIANT=NOD-KGR-KTL-CRV-SUB-ADA
-EnvironmentFile=/etc/harnessingts.env
+EnvironmentFile=/etc/RecursiveECG.env
 ExecStart=/usr/bin/env uv run ts-harness-server
 Restart=on-failure
 ```
@@ -221,7 +222,7 @@ Keep API keys in an environment file with restricted permissions. Put public dep
 Runtime workspaces are separate from the source repository. By default they live under:
 
 ```text
-~/.harnessingts/workspaces/default
+~/.RecursiveECG/workspaces/default
 ```
 
 Important workspace directories:
@@ -239,7 +240,7 @@ state/                      JSON state
 logs/                       JSONL logs
 ```
 
-SDK sessions run with `cwd` set to the runtime workspace. Task dependencies should be installed into that workspace, not into the HarnessingTS source repository:
+SDK sessions run with `cwd` set to the runtime workspace. Task dependencies should be installed into that workspace, not into the RecursiveECG source repository:
 
 ```bash
 uv run python script.py
