@@ -30,6 +30,8 @@ def build_main_runner(
     validate_reference_feature_extractor: Callable[[dict[str, Any]], Any] | None = None,
     variant: AblationVariant | None = None,
     on_part: Callable[[Part], None] | None = None,
+    on_session_id: Callable[[str], None] | None = None,
+    resume_session_id: str | None = None,
 ) -> SdkRunner:
     variant = variant or get_variant(DEFAULT_VARIANT_ID)
     ctx = PromptContext(str(workspace_path), locale)
@@ -59,6 +61,8 @@ def build_main_runner(
         mcp_server=mcp_server,
         log=MessageLog(log_path),
         on_part=on_part,
+        on_session_id=on_session_id,
+        resume_session_id=resume_session_id,
     ))
 
 
@@ -79,6 +83,7 @@ def build_node_runner(
     on_session_id: Callable[[str], None],
     on_part: Callable[[Part], None] | None = None,
     variant: AblationVariant | None = None,
+    resume_session_id: str | None = None,
 ) -> SdkRunner:
     variant = variant or get_variant(DEFAULT_VARIANT_ID)
     ctx = PromptContext(str(workspace_path), locale)
@@ -114,4 +119,5 @@ def build_node_runner(
         log=MessageLog(log_path),
         on_session_id=on_session_id,
         on_part=on_part,
+        resume_session_id=resume_session_id,
     ))

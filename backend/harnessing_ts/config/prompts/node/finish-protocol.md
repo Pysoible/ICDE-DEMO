@@ -1,6 +1,8 @@
 ## Harness Control Protocol
 完成本 node 时，不要输出 JSON 控制块，也不要声称系统状态已经完成迁移。
 
+完成前必须确认：Required outputs 全部存在；关键 validator 已通过；真实样本与合成样本来源已区分；warning、`indeterminate`、`unexplained` 和未解决阻塞已记录；长日志和大文件已通过路径或摘要引用，而不是直接塞入 summary。
+
 你必须在完成必要工件后调用 MCP 工具 `mcp__ts_harness__finish_node`，参数为：
 - `success`: 本 node 是否成功完成。
 - `summary`: 极短摘要，长内容必须写入报告文件。

@@ -453,6 +453,36 @@ app.innerHTML = `
       <pre id="dialogBody"></pre>
     </form>
   </dialog>
+
+  <dialog id="pauseDialog" class="pause-dialog">
+    <form method="dialog">
+      <header>
+        <div>
+          <div class="eyebrow"><span data-icon="Pause"></span><span>暂停当前执行</span></div>
+          <h3>请选择继续方式</h3>
+        </div>
+        <button value="cancel" class="icon-btn ghost" type="submit" title="取消"><span data-icon="X"></span></button>
+      </header>
+      <p class="pause-dialog-intro">暂停会先关闭当前模型进程，避免它在后台继续消耗 token。</p>
+      <div id="pauseOptions" class="pause-options">
+        <button type="button" class="pause-option" data-resume-mode="new_session">
+          <strong>重新启动新的 session</strong>
+          <span>不带入上一段模型对话，从当前工作区状态继续。</span>
+        </button>
+        <button type="button" class="pause-option" data-resume-mode="resume_keep">
+          <strong>复用上一个 session，保留当前消息</strong>
+          <span>保留被暂停的当前轮上下文，适合只是暂时停下的情况。</span>
+        </button>
+        <button type="button" class="pause-option pause-option-danger" data-resume-mode="resume_rollback">
+          <strong>复用上一个 session，回退当前消息</strong>
+          <span>移除工作区中当前未完成轮次的显示内容，并要求模型从回退前状态继续。</span>
+        </button>
+      </div>
+      <div class="pause-dialog-footer">
+        <button value="cancel" class="secondary-btn" type="submit">取消</button>
+      </div>
+    </form>
+  </dialog>
 `;
 
 const iconMap: Record<string, IconNode> = {
@@ -580,6 +610,8 @@ const els = {
   resetChatBtn: query<HTMLButtonElement>('#resetChatBtn'),
   clearAllLogsBtn: query<HTMLButtonElement>('#clearAllLogsBtn'),
   dialog: query<HTMLDialogElement>('#detailDialog'),
+  pauseDialog: query<HTMLDialogElement>('#pauseDialog'),
+  pauseOptions: query<HTMLElement>('#pauseOptions'),
   dialogTitle: query('#dialogTitle'),
   dialogBody: query('#dialogBody'),
   deleteReferenceBtn: query<HTMLButtonElement>('#deleteReferenceBtn'),
@@ -756,8 +788,10 @@ async function saveKnowledgeGraphLlmConfig() {
   els.graphApiKeyInput.value = '';
 }
 els.interruptBtn.addEventListener('click', async () => {
+  const resumeMode = await chooseResumeMode();
+  if (!resumeMode) return;
   const reason = els.messageInput.value.trim();
-  await interruptCurrent(reason || 'User interrupted from web UI.');
+  await interruptCurrent(reason || 'User interrupted from web UI.', resumeMode);
 });
 els.resetChatBtn.addEventListener('click', async () => {
   if (!confirm('这将重置聊天记录和 agent 工作流记忆，但保留 data/raw、references 和已构建的知识图谱。是否继续？')) return;
@@ -3172,10 +3206,34 @@ function nextPaint() {
   return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 }
 
-async function interruptCurrent(reason: string) {
+type ResumeMode = 'new_session' | 'resume_keep' | 'resume_rollback';
+
+function chooseResumeMode(): Promise<ResumeMode | null> {
+  return new Promise((resolve) => {
+    let selected: ResumeMode | null = null;
+    const finish = (mode: ResumeMode | null) => {
+      selected = mode;
+      els.pauseDialog.close();
+    };
+    const onClose = () => {
+      els.pauseDialog.removeEventListener('close', onClose);
+      resolve(selected);
+    };
+    els.pauseDialog.addEventListener('close', onClose, { once: true });
+    for (const option of els.pauseOptions.querySelectorAll<HTMLButtonElement>('[data-resume-mode]')) {
+      option.onclick = () => {
+        const mode = option.dataset.resumeMode;
+        if (mode === 'new_session' || mode === 'resume_keep' || mode === 'resume_rollback') finish(mode);
+      };
+    }
+    els.pauseDialog.showModal();
+  });
+}
+
+async function interruptCurrent(reason: string, resumeMode: ResumeMode) {
   els.interruptBtn.disabled = true;
   try {
-    const result = await postJson('/api/interrupt', { reason });
+    const result = await postJson('/api/interrupt', { reason, resumeMode });
     applyBootstrapSnapshot(result.bootstrap);
     if (state.busy) {
       state.loadingMessage = loadingPart('暂停中，等待当前请求收尾');

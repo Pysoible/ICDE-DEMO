@@ -39,6 +39,7 @@
 - 若 `tools/reference-feature-extractor/` 已通过后端校验，开始 case review 前必须读取 `manifest.json` 和 `README.md`，核对任务特定输入输出契约、`pythonApi`、源码入口和限制。后续应优先在实验或 case-review 脚本中按 README 以 Python module 方式 import 并调用该已验证 API；MCP `inspect_reference_feature_extractor` / `extract_reference_features` 可作为小输入 smoke test 或兼容入口，但不是大样本的强制路径。
 - 对每个被分析的 bad case 以及用于对照的每个 good/prototype case，若 reference feature extractor 可用，必须实际调用已验证 extractor（Python API 或 MCP 均可），不得用肉眼或 LLM 自行判断替代。报告必须记录实际调用方式、工具路径、API 函数名、处理样本 ID、输出摘要和失败/警告；如果输出采用 `features` 结构，应记录 feature value、unit、judgment、rule 和 evidence。工具返回 `indeterminate` 或任务自定义不确定状态时必须如实保留。
 - 每轮使用 reference feature extractor 时，应在 `runs/iterations/<iteration-id>/reference-feature-usage.json` 或等价 run artifact 中记录调用留痕：`toolPath`、`manifestPath`、`pythonApi`、调用模式（`python_module` 或 `mcp`）、样本数量、成功/失败数量、异常信息和输出文件路径。iteration 报告中声称使用 reference features 时必须能追溯到该调用记录。
+- case review 必须先对完整的可评估样本集合做一次批量汇总，得到正式评测指标、错误数量/类型分布、分组统计和用于筛选的关键数值；完成该汇总并确定采样策略后，才能进行逐样本读取、特征提取或可视化。批量汇总不能替代选定 bad case 的深入分析，但不得对未入选样本逐一执行深度检查。
 - case review 必须产出完整报告 `reports/iterations/<iteration-id>-case-review.md`，至少包含：
   - **Case review scope**：定义本轮什么算作bad case。
   - **Sampling policy**：
@@ -48,7 +49,8 @@
     - 报告中必须写清楚 bad case 总数、采样数量、采样维度、每个样本被选中的原因。
   - **Per-case visualization**：
     - 每个被分析样本都必须有样本可视化结果。若数据形态不支持，必须提供等价可解释视图并说明原因。时间序列任务应展示原始序列局部窗口、目标点/片段、预测结果、真实标签/参考答案、关键工具特征或 score；分类任务应展示原始样本或可解释视图、预测类别、真实类别和关键证据。
-    - 所有可视化图片必须以 250 DPI 生成，保存到 `runs/iterations/<iteration-id>/case-review/visualizations/`，并在报告中使用正确的 Markdown 图片格式逐一引用，确保 case review 中能正确显示。
+    - 所有可视化图片必须保存到 `runs/iterations/<iteration-id>/case-review/visualizations/`，并在报告中使用正确的 Markdown 图片格式逐一引用，确保 case review 中能正确显示。默认使用 120–150 DPI，并将展示版本限制在不超过 1600×900 像素；如需保留更高分辨率原图，必须同时生成并引用展示用缩略图。
+    - 图片加载、预览或绘图失败时，不得反复重试或阻塞整个 case review。先仅进行一次有界的降级尝试（例如缩小输入、生成展示用缩略图、降低 DPI，或改用等价的数值/文本视图）；仍然失败时记录失败原因、保留可追溯的输入和输出路径，明确标注可视化不可用，并继续使用原始数值证据完成分析和报告。
     - **Per-case analysis**：每个样本必须单独成节，包含：
     - 样本 ID、错误类型、真实结果、预测结果、score/confidence/rank 或其他当前方法输出。
     - 原始输入证据：从 `user/data-spec.md` 定义的原始字段读取并展示，不允许只看模型 score。
@@ -66,7 +68,7 @@
     - 该步骤必须在所有选定 bad case 的逐样本分析和上述统计综合完成后执行。此时 agent 应先总结自己从样本证据中获得的“样本启发”，再思考哪种图形设计最能解释该启发；不要在逐 case 分析完成前预先绘制结论图，也不要生成与样本证据无关的装饰性图表。
     - agent 必须亲自完成可复现的可视化流程：确定要表达的启发与证据映射，设计图形结构，撰写绘图代码，按 `user/data-spec.md` 读取所需原始数据和方法输出，执行代码并检查生成结果。绘图代码、执行命令、输入路径和输出路径必须在本轮 run 工件或 case review 中可追溯。
     - summary 可视化可以是一张或多张，但每张都必须保存为 PNG，并写入 `runs/iterations/<iteration-id>/case-review/visualizations/`。文件名必须使用 `summary_` 前缀，后续语义名称使用下划线 `_` 分隔，例如 `summary_failure_patterns.png`；不得使用空格或连字符作为分隔符。
-    - 每张 summary PNG 必须以 250 DPI 生成，画布宽高比必须为 16:9。强调色优先依次采用蓝、橙、绿、红；其他颜色只能作为中性背景、坐标、辅助线或确有必要的补充编码，并应保证图例和语义一致。
+    - 每张 summary PNG 默认使用 120–150 DPI，展示版本不得超过 1600×900 像素，画布宽高比必须为 16:9。强调色优先依次采用蓝、橙、绿、红；其他颜色只能作为中性背景、坐标、辅助线或确有必要的补充编码，并应保证图例和语义一致。若保留高分辨率原图，必须另存展示用缩略图并在报告中引用缩略图。
     - summary 可视化必须直接支撑 case review 中的样本启发、主要失败机制或下一轮方向。报告应逐图引用，并说明图片表达的启发、使用的数据范围、关键视觉编码以及不能从图中推出的结论。
 - case review 的数值归因链路必须完整：
   - 先从 `user/data-spec.md` 找到原始输入字段，读取 bad case 的原始时间序列。

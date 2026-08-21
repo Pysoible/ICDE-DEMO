@@ -71,6 +71,12 @@ class WorkspaceStore:
             if "activeNodeSessionId" not in existing:
                 existing["activeNodeSessionId"] = None
                 self.write_state(existing)
+            if "mainSdkSessionId" not in existing:
+                existing["mainSdkSessionId"] = None
+                self.write_state(existing)
+            if "mainResumeMode" not in existing:
+                existing["mainResumeMode"] = "new_session"
+                self.write_state(existing)
             if "contractConfirmed" not in existing:
                 existing["contractConfirmed"] = bool(existing.pop("taskContractConfirmed", False))
                 self.write_state(existing)
@@ -109,6 +115,8 @@ class WorkspaceStore:
             "contractConfirmed": False,
             "finalSummaryConfirmed": False,
             "runtimeSettings": self.read_runtime_settings(),
+            "mainSdkSessionId": None,
+            "mainResumeMode": "new_session",
         }
         self.write_state(state)
         self.append_timeline({"type": "workspace_initialized", "timestamp": ts, "payload": {"mode": state["mode"]}})

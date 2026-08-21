@@ -27,9 +27,20 @@ from harnessing_ts.reference_feature_extractor import (
     validate_reference_feature_extractor,
 )
 from harnessing_ts.prompts.compose import PromptContext, build_main_attachment
-from harnessing_ts.schema import NODE_SPECS, ControlRequest, NodeSession, NodeType, Part, RunRecord, WorkspaceState
+from harnessing_ts.schema import (
+    NODE_SPECS,
+    RESUME_MODES,
+    ControlRequest,
+    NodeSession,
+    NodeType,
+    Part,
+    ResumeMode,
+    RunRecord,
+    WorkspaceState,
+)
 from harnessing_ts.settings.llm import LlmConfig, mask_llm_config, read_effective_llm_config
 from harnessing_ts.state.jsonl import clear_file
+from harnessing_ts.state.message_log import MessageLog
 from harnessing_ts.state.workspace_store import WorkspaceStore, now_iso
 from harnessing_ts.tools.compose_tools import build_node_native_tools
 from harnessing_ts.variants import resolve_variant
@@ -450,9 +461,15 @@ class HarnessOrchestrator:
             await self._refresh_main_runner_for_dynamic_tools()
         return status
 
-    async def interrupt_current(self, reason: str | None = None) -> dict[str, Any]:
+    async def interrupt_current(
+        self,
+        reason: str | None = None,
+        resume_mode: ResumeMode = "new_session",
+    ) -> dict[str, Any]:
         self._ensure_initialized()
         assert self.state
+        if resume_mode not in RESUME_MODES:
+            raise ValueError(f"Unsupported resume mode: {resume_mode}")
         message = reason or "Interrupted by user."
         target = "none"
         node_runner_active = bool(self.active_node_runner and self.active_node_runner.is_running)
@@ -463,25 +480,46 @@ class HarnessOrchestrator:
             target = "node"
             node = self.active_node_session or self._restore_active_node_session()
             if node and node.get("status") == "paused":
+                node["resumeMode"] = resume_mode
+                if resume_mode == "resume_rollback":
+                    self._rollback_interrupted_log(
+                        self.store.node_log_path(node["id"]),
+                        target="node",
+                        node_session_id=node["id"],
+                    )
+                self.store.write_node_session(node)
+                await self._close_active_node_runner("user_interrupt_already_paused")
+                await self._close_main_runner(
+                    reason="user_interrupt_already_paused",
+                    message="Main runner closed while confirming a paused node.",
+                )
                 self.active_node_session = node
                 return {"target": target, "state": self.get_state(), "alreadyPaused": True}
-            if node_runner_active and self.active_node_runner:
-                try:
-                    await self.active_node_runner.interrupt()
-                except Exception:
-                    pass
-            if main_runner_active and self.main_runner:
-                try:
-                    await self.main_runner.interrupt()
-                except Exception:
-                    pass
-                self.store.append_timeline({
-                    "type": "main_interrupted",
-                    "timestamp": now_iso(),
-                    "message": "Main runner interrupted while pausing active node.",
-                    "payload": {"reason": message},
-                })
+            if self.active_node_runner is not None:
+                session_id = getattr(self.active_node_runner, "session_id", None)
+                if node and session_id:
+                    node["sdkSessionId"] = session_id
+                await self._close_active_node_runner("user_interrupt")
+            if self.main_runner is not None:
+                await self._close_main_runner(
+                    reason="user_interrupt",
+                    message="Main runner closed while pausing active node.",
+                )
+                if main_runner_active:
+                    self.store.append_timeline({
+                        "type": "main_interrupted",
+                        "timestamp": now_iso(),
+                        "message": "Main runner interrupted while pausing active node.",
+                        "payload": {"reason": message},
+                    })
             if node:
+                node["resumeMode"] = resume_mode
+                if resume_mode == "resume_rollback":
+                    self._rollback_interrupted_log(
+                        self.store.node_log_path(node["id"]),
+                        target="node",
+                        node_session_id=node["id"],
+                    )
                 node["status"] = "paused"
                 node["summary"] = f"Paused by user: {message}"
                 self.store.write_node_session(node)
@@ -492,25 +530,56 @@ class HarnessOrchestrator:
                     "nodeSessionId": node["id"],
                     "nodeType": node["nodeType"],
                     "message": message,
+                    "payload": {"resumeMode": resume_mode},
                 })
             self.store.write_state(self.state)
             self.active_node_runner = None
             self.active_node_session = node
         elif main_runner_active and self.main_runner:
             target = "main"
-            try:
-                await self.main_runner.interrupt()
-            except Exception:
-                pass
+            session_id = getattr(self.main_runner, "session_id", None)
+            if session_id:
+                self.state["mainSdkSessionId"] = session_id
+            self.state["mainResumeMode"] = resume_mode
+            if resume_mode == "resume_rollback":
+                self._rollback_interrupted_log(self.store.main_log_path, target="main")
+            self.store.write_state(self.state)
+            await self._close_main_runner(
+                reason="user_interrupt",
+                message="Main runner closed after user interrupt.",
+            )
             part = system_text_part(f"Harness interrupt: {message}")
             self.store.append_main_part(part)
-            self.store.append_timeline({"type": "main_interrupted", "timestamp": now_iso(), "message": message})
+            self.store.append_timeline({
+                "type": "main_interrupted",
+                "timestamp": now_iso(),
+                "message": message,
+                "payload": {"resumeMode": resume_mode},
+            })
         else:
             self.store.append_timeline({"type": "interrupt_ignored", "timestamp": now_iso(), "message": "No active runner."})
         return {"target": target, "state": self.get_state()}
 
+    def _rollback_interrupted_log(
+        self,
+        path: Path,
+        *,
+        target: str,
+        node_session_id: str | None = None,
+    ) -> None:
+        if not MessageLog.rollback_last_user_turn(path):
+            return
+        self.store.append_timeline({
+            "type": "interrupted_turn_rolled_back",
+            "timestamp": now_iso(),
+            "nodeSessionId": node_session_id,
+            "message": f"Rolled back the interrupted {target} turn in the workspace transcript.",
+            "payload": {"target": target, "resumeMode": "resume_rollback"},
+        })
+
     async def _resume_active_node(self, text: str, node: NodeSession) -> list[Part]:
         assert self.state
+        resume_mode = node.get("resumeMode", "new_session")
         node["status"] = "running"
         node["summary"] = "Resumed with user guidance."
         self.store.write_node_session(node)
@@ -521,6 +590,7 @@ class HarnessOrchestrator:
             "nodeSessionId": node["id"],
             "nodeType": node["nodeType"],
             "message": text[:500],
+            "payload": {"resumeMode": resume_mode},
         })
         if self.dry_run:
             part = system_text_part("Dry run mode: paused node received resume guidance.")
@@ -528,13 +598,22 @@ class HarnessOrchestrator:
             return [part]
         self._spawn_node_runner(node)
         assert self.active_node_runner
+        resume_instruction = ""
+        if resume_mode == "resume_rollback":
+            resume_instruction = (
+                "上一轮执行已被用户回退。请把上一轮未完成的用户请求和 assistant 输出视为不存在，"
+                "不要继续上一轮卡住的推理或工具调用，只基于回退前的有效状态和本次说明重新规划。"
+            )
         prompt = "\n".join([
             f"请继续执行 {node['nodeType']} node。此前节点被用户暂时中断，现在用户补充了以下说明：",
+            resume_instruction,
             "",
             text,
             "",
             "请结合已有 workspace 文件、节点日志和这条补充说明继续推进当前 node。不要重新开始整个 pipeline，除非用户明确要求。",
         ])
+        node["resumeMode"] = "new_session"
+        self.store.write_node_session(node)
         try:
             parts = await self.active_node_runner.send_with_user_echo(prompt)
         except BaseException as exc:
@@ -1763,6 +1842,20 @@ class HarnessOrchestrator:
     def _ensure_main_runner(self) -> None:
         if self.main_runner:
             return
+        current_state = self.store.read_state() or self.state
+        resume_mode = current_state.get("mainResumeMode", "new_session") if current_state else "new_session"
+        resume_session_id = None
+        if resume_mode in {"resume_keep", "resume_rollback"} and current_state:
+            resume_session_id = current_state.get("mainSdkSessionId")
+
+        def on_session_id(sdk_session_id: str) -> None:
+            latest_state = self.store.read_state() or self.state
+            if not latest_state:
+                return
+            latest_state["mainSdkSessionId"] = sdk_session_id
+            self.store.write_state(latest_state)
+            self.state = latest_state
+
         knowledge_query_ready = self._knowledge_query_ready()
         reference_feature_ready = self.variant.reference_feature_extractor and self.store.is_reference_feature_extractor_ready()
         self.main_runner = build_main_runner(
@@ -1776,7 +1869,13 @@ class HarnessOrchestrator:
             validate_reference_feature_extractor=self.request_validate_reference_feature_extractor if self.variant.knowledge_to_tools else None,
             variant=self.variant,
             on_part=self._emit_main_parts,
+            on_session_id=on_session_id,
+            resume_session_id=resume_session_id,
         )
+        if current_state:
+            current_state["mainResumeMode"] = "new_session"
+            self.store.write_state(current_state)
+            self.state = current_state
         self._main_runner_knowledge_graph_ready = knowledge_query_ready
         self._main_runner_reference_feature_ready = reference_feature_ready
 
@@ -1798,6 +1897,8 @@ class HarnessOrchestrator:
     def _spawn_node_runner(self, node: NodeSession) -> None:
         node_id = node["id"]
         node_type = node["nodeType"]
+        resume_mode = node.get("resumeMode", "new_session")
+        resume_session_id = node.get("sdkSessionId") if resume_mode in {"resume_keep", "resume_rollback"} else None
 
         def on_session_id(sdk_session_id: str) -> None:
             node["sdkSessionId"] = sdk_session_id
@@ -1819,4 +1920,5 @@ class HarnessOrchestrator:
             on_session_id=on_session_id,
             on_part=lambda part: self._emit_node_parts(node_id, part),
             variant=self.variant,
+            resume_session_id=resume_session_id,
         )

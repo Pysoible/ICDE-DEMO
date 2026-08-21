@@ -63,6 +63,7 @@ class _FakeNodeRunner:
 
     def __init__(self) -> None:
         self.is_running = True
+        self.session_id = "test-sdk-session"
         self.user_messages: list[str] = []
         self.raise_on: dict[int, BaseException] = {}
         self._turn = 0
@@ -320,6 +321,54 @@ def test_interrupt_current_is_idempotent_for_already_paused_node(tmp_path) -> No
     assert result["alreadyPaused"] is True
     node_parts = orchestrator.store.read_node_parts(node["id"])
     assert not any("second click" in str(part.get("text", "")) for part in node_parts)
+
+
+def test_interrupt_current_closes_node_and_main_runners(tmp_path) -> None:
+    orchestrator = _make_orchestrator(tmp_path)
+    node = _create_running_node(orchestrator, "problem-contract")
+    node_runner = _FakeNodeRunner()
+    main_runner = _FakeNodeRunner()
+    orchestrator.active_node_runner = node_runner  # type: ignore[assignment]
+    orchestrator.main_runner = main_runner  # type: ignore[assignment]
+
+    result = asyncio.run(orchestrator.interrupt_current("stop all runners"))
+
+    latest = orchestrator.store.read_node_session(node["id"])
+    assert latest is not None
+    assert latest["status"] == "paused"
+    assert result["target"] == "node"
+    assert not node_runner.is_running
+    assert not main_runner.is_running
+    assert orchestrator.active_node_runner is None
+    assert orchestrator.main_runner is None
+    timeline = orchestrator.store.read_timeline()
+    assert any(event["type"] == "active_node_runner_closed" for event in timeline)
+    assert any(event["type"] == "main_runner_closed" for event in timeline)
+
+
+def test_interrupt_current_persists_resume_mode_and_rolls_back_transcript(tmp_path) -> None:
+    orchestrator = _make_orchestrator(tmp_path)
+    node = _create_running_node(orchestrator, "problem-contract")
+    orchestrator.store.append_node_part(node["id"], user_text_part("the stalled request"))
+    orchestrator.store.append_node_part(node["id"], {
+        "id": "unfinished-response",
+        "timestamp": "2026-08-20T00:00:00Z",
+        "role": "assistant",
+        "type": "text",
+        "text": "a long unfinished response",
+    })
+    orchestrator.active_node_runner = _FakeNodeRunner()  # type: ignore[assignment]
+
+    asyncio.run(orchestrator.interrupt_current("rollback stalled turn", "resume_rollback"))
+
+    latest = orchestrator.store.read_node_session(node["id"])
+    assert latest is not None
+    assert latest["resumeMode"] == "resume_rollback"
+    parts = orchestrator.store.read_node_parts(node["id"])
+    assert not any(part.get("text") == "the stalled request" for part in parts)
+    assert not any(part.get("text") == "a long unfinished response" for part in parts)
+    timeline = orchestrator.store.read_timeline()
+    assert any(event["type"] == "interrupted_turn_rolled_back" for event in timeline)
 
 
 def test_protocol_recovery_does_not_corrupt_timeline_jsonl(tmp_path) -> None:

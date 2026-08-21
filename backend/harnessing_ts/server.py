@@ -5,7 +5,7 @@ import mimetypes
 import os
 import socket
 import sys
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import unquote
 
 import uvicorn
@@ -32,6 +32,7 @@ class ClearLogsRequest(BaseModel):
 
 class InterruptRequest(BaseModel):
     reason: str | None = None
+    resumeMode: Literal["new_session", "resume_keep", "resume_rollback"] = "new_session"
 
 
 class ControlDecisionRequest(BaseModel):
@@ -425,7 +426,7 @@ def create_app() -> FastAPI:
     @app.post("/api/interrupt")
     async def interrupt(request: InterruptRequest) -> dict[str, Any]:
         try:
-            result = await orchestrator.interrupt_current(request.reason)
+            result = await orchestrator.interrupt_current(request.reason, request.resumeMode)
         except Exception as exc:
             orchestrator.store.append_timeline({"type": "interrupt_error", "timestamp": now_iso_for_server(), "message": str(exc)})
             result = {"target": "unknown", "error": str(exc), "state": orchestrator.get_state()}

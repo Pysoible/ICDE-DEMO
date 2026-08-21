@@ -3497,6 +3497,61 @@ dialog pre {
   border-radius: 0;
 }
 
+.pause-dialog {
+  width: min(620px, calc(100vw - 36px));
+}
+
+.pause-dialog-intro {
+  margin: 0;
+  padding: 16px 18px 4px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.pause-options {
+  display: grid;
+  gap: 10px;
+  padding: 12px 18px 16px;
+}
+
+.pause-option {
+  display: grid;
+  gap: 5px;
+  padding: 14px 15px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink);
+  text-align: left;
+}
+
+.pause-option:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  transform: none;
+}
+
+.pause-option strong {
+  font-size: 14px;
+}
+
+.pause-option span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.pause-option-danger:hover {
+  border-color: var(--red);
+  background: var(--red-soft);
+}
+
+.pause-dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 18px 18px;
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);

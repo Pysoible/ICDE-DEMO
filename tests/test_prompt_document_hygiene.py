@@ -77,6 +77,29 @@ def test_common_node_rules_allow_only_native_and_injected_harness_tools() -> Non
     assert "只能使用本 node 的 native tools，以及系统明确注入的 Harness MCP 工具" in common_rules
 
 
+def test_shared_prompt_contains_universal_reliability_rules() -> None:
+    role_kernel = (
+        REPO_ROOT
+        / "backend"
+        / "harnessing_ts"
+        / "config"
+        / "prompts"
+        / "shared"
+        / "role-kernel.md"
+    ).read_text(encoding="utf-8")
+
+    for phrase in (
+        "检查当前任务的输入文件、输出文件、Schema、可用工具和验证方式",
+        "只能调用当前实际注入且明确可用的工具",
+        "先用少量真实输入做 smoke test",
+        "大型 JSON、日志和图片不得直接输出到对话",
+        "validator 报错时必须修复具体错误",
+        "候选筛选、模型选择、方案组合、阈值和停止判断必须与该目标一致",
+        "必须用相同输入做对照验证，确认关键输出和评测结果与候选一致",
+    ):
+        assert phrase in role_kernel
+
+
 def test_node_specs_match_mandatory_output_contracts() -> None:
     problem_outputs = node_document("problem-contract")["produces"]
     iterative_outputs = node_document("iterative-solving")["produces"]
@@ -163,14 +186,20 @@ def test_knowledge_to_tools_requires_real_sample_validation() -> None:
 def test_iterative_case_review_visualization_contract_is_explicit() -> None:
     guidance = node_document("iterative-solving")["guidance"]
 
+    assert "先对完整的可评估样本集合做一次批量汇总" in guidance
+    assert "不得对未入选样本逐一执行深度检查" in guidance
+    assert "不得反复重试或阻塞整个 case review" in guidance
+    assert "一次有界的降级尝试" in guidance
+    assert "继续使用原始数值证据完成分析和报告" in guidance
     assert "runs/iterations/<iteration-id>/case-review/visualizations/" in guidance
     assert "所有选定 bad case 的逐样本分析和上述统计综合完成后执行" in guidance
     assert "撰写绘图代码" in guidance
     assert "按 `user/data-spec.md` 读取" in guidance
     assert "`summary_` 前缀" in guidance
     assert "保存为 PNG" in guidance
-    assert guidance.count("250 DPI") >= 2
-    assert "DPI 不得低于 30" not in guidance
+    assert guidance.count("120–150 DPI") >= 2
+    assert "250 DPI" not in guidance
+    assert "1600×900" in guidance
     assert "宽高比必须为 16:9" in guidance
     assert "蓝、橙、绿、红" in guidance
 

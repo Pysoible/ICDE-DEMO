@@ -25,6 +25,7 @@ class SdkRunnerConfig:
     mcp_server: Any | None = None
     on_part: Callable[[Part], None] | None = None
     on_session_id: Callable[[str], None] | None = None
+    resume_session_id: str | None = None
 
 
 class SdkRunner:
@@ -69,6 +70,8 @@ class SdkRunner:
         }
         if self.config.model:
             kwargs["model"] = self.config.model
+        if self.config.resume_session_id:
+            kwargs["resume"] = self.config.resume_session_id
         if self.config.extra_args:
             kwargs["extra_args"] = self.config.extra_args
         if self.config.mcp_server is not None:
