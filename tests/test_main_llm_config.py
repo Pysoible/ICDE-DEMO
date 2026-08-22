@@ -20,11 +20,10 @@ def test_write_main_llm_config_persists_and_merges(tmp_path) -> None:
     written = store.write_main_llm_config(
         {
             "authMode": "manual",
-            "protocol": "anthropic",
+            "protocol": "deepseek",
             "model": "deepseek-v4-pro",
             "apiKey": "sk-abcdef1234",
-            "baseUrl": "https://api.deepseek.com/anthropic",
-            "contextWindow": "200k",
+            "baseUrl": "https://api.deepseek.com/beta",
         }
     )
     assert written["model"] == "deepseek-v4-pro"
@@ -33,8 +32,7 @@ def test_write_main_llm_config_persists_and_merges(tmp_path) -> None:
     raw = json.loads((tmp_path / "config.llm.json").read_text(encoding="utf-8"))
     assert raw["model"] == "deepseek-v4-pro"
     assert raw["apiKey"] == "sk-abcdef1234"
-    assert raw["protocol"] == "anthropic"
-    assert raw["contextWindow"] == "200k"
+    assert raw["protocol"] == "deepseek"
 
     store.write_main_llm_config({"model": "qwen3.6-plus"})
     raw = json.loads((tmp_path / "config.llm.json").read_text(encoding="utf-8"))
@@ -61,13 +59,11 @@ def test_write_main_llm_config_sanitizes_invalid_values(tmp_path) -> None:
         {
             "authMode": "injected-mode",
             "protocol": "fake-protocol",
-            "contextWindow": "5m",
             "model": 12345,  # type: ignore[dict-item]
         }
     )
     assert written["authMode"] == "manual"
     assert written["protocol"] is None
-    assert written["contextWindow"] is None
     assert written["model"] == ""
 
 
@@ -84,11 +80,10 @@ def test_post_llm_config_endpoint_round_trips(tmp_path, monkeypatch) -> None:
         "/api/llm-config",
         json={
             "authMode": "manual",
-            "protocol": "anthropic",
+            "protocol": "deepseek",
             "model": "endpoint-test-model",
             "apiKey": "sk-endpoint-key-1",
-            "baseUrl": "https://example.com/anthropic",
-            "contextWindow": "200k",
+            "baseUrl": "https://example.com/v1",
         },
     )
     assert response.status_code == 200

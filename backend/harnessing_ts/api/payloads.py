@@ -43,6 +43,7 @@ def build_bootstrap_payload(
         "dryRun": dry_run,
         "debugEnabled": debug_enabled,
         "runtime": _runtime_payload(orchestrator, task_running),
+        "execution": orchestrator.execution.snapshot(),
     }
 
 
@@ -71,6 +72,7 @@ def build_live_payload(
         "chainSummaryBuild": orchestrator.get_chain_summary_status(),
         "chainSummaryParts": orchestrator.get_chain_summary_parts(),
         "runtime": _runtime_payload(orchestrator, task_running),
+        "execution": orchestrator.execution.snapshot(),
     }
 
 
@@ -82,8 +84,11 @@ def masked_llm_config(workspace_path: Path) -> dict[str, Any]:
 
 def _runtime_payload(orchestrator: HarnessOrchestrator, task_running: TaskRunning) -> dict[str, Any]:
     pipeline_complete = orchestrator.node_state.is_pipeline_complete(orchestrator.get_state())
+    node_running = orchestrator.is_active_node_task_running()
+    execution = orchestrator.execution.snapshot()
     return {
-        "running": False if pipeline_complete else task_running(getattr(orchestrator, "_server_run_task", None)),
+        "running": False if pipeline_complete else execution["phase"] in {"running", "pausing", "recovering"},
+        "nodeRunning": node_running,
         "knowledgeGraphRunning": task_running(getattr(orchestrator, "_server_knowledge_graph_task", None)),
         "chainSummaryRunning": task_running(getattr(orchestrator, "_server_chain_summary_task", None)),
         "pipelineComplete": pipeline_complete,

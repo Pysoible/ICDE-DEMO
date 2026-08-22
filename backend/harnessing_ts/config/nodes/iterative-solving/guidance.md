@@ -4,8 +4,8 @@
 核心约束：
 - 每轮必须在候选阶段提出 k 个候选解决方案。k 不是固定常量，必须在候选生成前调用 MCP `mcp__ts_harness__get_runtime_settings`，读取 `iterativeCandidateCount` 作为本轮 k；如果用户在前端实时修改 k，后续读取必须采用新值。
 - 候选阶段不是方法排行榜或 baseline sweep。每个候选都必须围绕 contract、上一轮失败机制、当前变体可用的 reference knowledge source 和数据证据形成清晰假设。
-- 每个候选必须分配一个 subagent 使用 `Task` 独立测试和 review。subagent 的输出必须包括：候选假设、最小实现或复用工具路径、评估命令、指标、bad-case 抽样与 case review 结论、风险、是否建议进入统一方案。
-- 主 node 负责统一综合所有 subagent 结果，记录为什么选择某个候选、组合候选、放弃候选或继续探索。不要让 subagent 直接调用 `mcp__ts_harness__finish_node`。
+- 必须分别独立测试和 review 每个候选。每份候选审查应包括：候选假设、最小实现或复用工具路径、评估命令、指标、bad-case 抽样与 case review 结论、风险、是否建议进入统一方案。
+- 主 node 负责统一综合所有候选审查结果，记录为什么选择某个候选、组合候选、放弃候选或继续探索。
 - 只有被统一综合后决定保留或执行的方案，才必须落盘为 `tools/` 下标准化工具或工具组合；被淘汰候选的代码可留在 `runs/iterations/<iteration-id>/candidates/<candidate-id>/`，但不得污染 `tools/registry.json`。
 - 如果多个候选被组合，组合本身必须有明确接口、证据和风险说明，不能只是把多个结果并排报告。
 
@@ -22,8 +22,8 @@
   - 或一种已有工具组合，例如“先用形态特征筛查，再用上一轮相似度工具复核”。组合本身也必须是一个明确方案。
   - 或一种可能的优化策略，例如在原有方法上修改部分可变参数或新增特殊模块。优化策略本身也必须是一个明确方案。优化策略包括参数、阈值、窗口、特征开关或模块增量。
 - 为每个候选创建 `runs/iterations/<iteration-id>/candidates/<candidate-id>/`，保存候选说明、subagent 测试记录、指标、样例输出、case review 摘要和风险。
-- 调用 k 个 `Task` subagent。每个 subagent 只能审查自己负责的候选，不要互相覆盖文件；主 node 必须在收到全部结果后做统一综合。
-- 运行训练、搜索、批量评估或其他可能卡住的命令时，必须为每个命令设置明确边界：优先使用 `timeout <duration> ...` 前台执行；若必须后台运行，必须把启动命令、当前 workspace 绝对路径、PID、stdout/stderr 和退出状态写入本候选或本轮 `runs/iterations/<iteration-id>/...` 下的记录文件。严禁用 `pkill`、`killall`、`pgrep` 管道、按脚本名/模型名模糊匹配或全局 `kill -9` 清理卡住任务。只能终止由当前 node/当前 subagent 在当前 workspace 启动且有记录可证明归属的 PID，并且先普通 `kill`、等待、复查；只有该 PID 仍存活且归属再次确认后才可对同一 PID 使用 `kill -9`。不得终止其他候选、其他 subagent、其他 workspace、Harness server、Claude/SDK runner 或用户进程；无法确认时不要 kill，把风险和残留 PID 写入候选报告。
+- 按候选逐个执行 k 份独立审查，避免不同候选的实验或文件修改互相覆盖；完成全部审查后再做统一综合。
+- 运行训练、搜索、批量评估或其他可能卡住的命令时，必须为每个命令设置明确边界：优先使用 `timeout <duration> ...` 前台执行；若必须后台运行，必须把启动命令、当前 workspace 绝对路径、PID、stdout/stderr 和退出状态写入本候选或本轮 `runs/iterations/<iteration-id>/...` 下的记录文件。严禁用 `pkill`、`killall`、`pgrep` 管道、按脚本名/模型名模糊匹配或全局 `kill -9` 清理卡住任务。只能终止由当前 node/当前 subagent 在当前 workspace 启动且有记录可证明归属的 PID，并且先普通 `kill`、等待、复查；只有该 PID 仍存活且归属再次确认后才可对同一 PID 使用 `kill -9`。不得终止其他候选、其他 subagent、其他 workspace、Harness server、DSH runtime/SDK runner 或用户进程；无法确认时不要 kill，把风险和残留 PID 写入候选报告。
 - 写入 `reports/iterations/<iteration-id>-candidate-review.md`，至少包含候选列表、k 来源、每个候选的 subagent 输出摘要、指标对比、bad-case review 摘要、与 knowledge graph 的关联、淘汰/保留原因和统一结论。
 - 将统一后本轮保留或执行的方法标准化落盘到 `tools/<tool-name>/` 或 `tools/generated/<tool-name>/`。至少包含：
   - 可调用入口，例如 Python module、CLI script 或函数封装。

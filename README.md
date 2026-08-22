@@ -1,6 +1,6 @@
 # RecursiveECG
 
-RecursiveECG is a time-series tool-use harness built on the Python Claude Code SDK.
+RecursiveECG is a time-series tool-use harness built on the official Python DeepSeek Harness SDK.
 It helps an agent work through a time-series task with references, data exploration, a problem contract, iterative tool building, evidence review, and a final summary.
 
 It is not a leaderboard or model-comparison framework. The goal is a structured, auditable problem-solving workflow.
@@ -9,28 +9,11 @@ It is not a leaderboard or model-comparison framework. The goal is a structured,
 
 ### 1. Install Prerequisites
 
-You need Python 3.11+, Git, [uv](https://docs.astral.sh/uv/), [Bun](https://bun.sh/), and the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/getting-started). The Python SDK starts the Claude Code CLI as a subprocess, so installing only Python dependencies is not enough.
+You need Python 3.11+, Git, [uv](https://docs.astral.sh/uv/), Node.js 20+ with npm, [Bun](https://bun.sh/) for the frontend, and a DeepSeek-compatible API credential. `uv sync` installs the official DeepSeek Harness Python SDK. Runtime execution uses the project-local, package-locked Node composition in `backend/dsh_runtime/`, which contains the JSON-RPC server, Cordis composition, MCP client, filesystem/shell tools, Web plugins, and subagent plugins.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-curl -fsSL https://bun.sh/install | bash
-
-export BUN_INSTALL="$HOME/.bun"
-export PATH="$BUN_INSTALL/bin:$PATH"
-
-bun install --global @anthropic-ai/claude-code
-
 uv --version
-bun --version
-claude --version
-claude doctor
-```
-
-Persist Bun's path in your shell profile so `claude` remains available after opening a new terminal:
-
-```bash
-export BUN_INSTALL="$HOME/.bun"
-export PATH="$BUN_INSTALL/bin:$PATH"
 ```
 
 ### 2. Prepare The Project
@@ -43,28 +26,27 @@ uv sync
 uv run ts-harness setup-server
 ```
 
-`setup-server` builds the production frontend and prepares a shared runtime base for task workspaces. It does not install Claude Code globally; that is why the Bun step above is required.
+`setup-server` installs and verifies the project-local DeepSeek Harness Node runtime, builds the production frontend, and prepares a shared runtime base for task workspaces. The Python SDK is configured to launch this local runtime explicitly, rather than relying on a bundled runtime. To refresh it independently, run `npm ci --prefix backend/dsh_runtime`. Do not update the Python SDK or `backend/dsh_runtime` packages independently; run the full test suite after a coordinated runtime upgrade.
 
 ### 3. Configure The LLM
 
 Choose one authentication mode.
 
-Use Claude Code's local login:
+Use DeepSeek Harness environment credentials:
 
 ```bash
-claude
 export TS_HARNESS_LLM_AUTH_MODE=sdk-default
+export DEEPSEEK_API_KEY=YOUR_API_KEY
 ```
 
-Or use an Anthropic-compatible endpoint:
+Or save an explicit DeepSeek-compatible endpoint configuration:
 
 ```bash
 export TS_HARNESS_LLM_AUTH_MODE=manual
-export TS_HARNESS_LLM_PROTOCOL=anthropic
-export TS_HARNESS_LLM_MODEL=qwen3.6-plus
-export TS_HARNESS_LLM_BASE_URL=https://dashscope.aliyuncs.com/api/v2/apps/anthropic
+export TS_HARNESS_LLM_PROTOCOL=deepseek
+export TS_HARNESS_LLM_MODEL=deepseek-v4-flash
+export TS_HARNESS_LLM_BASE_URL=https://api.deepseek.com
 export TS_HARNESS_LLM_API_KEY=YOUR_API_KEY
-export TS_HARNESS_LLM_CONTEXT_WINDOW=200k
 ```
 
 Check the effective configuration without printing the full API key:
@@ -72,6 +54,20 @@ Check the effective configuration without printing the full API key:
 ```bash
 uv run ts-harness llm-config
 ```
+
+### Optional Web Tools
+
+Filesystem, shell, and `SUB` subagent tools are supplied by the local DSH runtime and filtered by the active node/variant. Web tools are disabled unless the deployment opts in:
+
+```bash
+# Only enable where the server is not able to reach sensitive internal hosts.
+export TS_HARNESS_ENABLE_WEB_FETCH=true
+
+# Reuses DEEPSEEK_API_KEY for search.
+export TS_HARNESS_ENABLE_WEB_SEARCH=true
+```
+
+The current upstream HTTP fetch provider does not provide private-network/SSRF protection, so do not enable `TS_HARNESS_ENABLE_WEB_FETCH` on a host that can access trusted internal services.
 
 ### 4. Start Locally
 
@@ -95,7 +91,7 @@ Useful launch options:
 # Show registered ablation profiles and legacy aliases.
 uv run ts-harness variants
 
-# Run the UI without calling the Claude Code SDK.
+# Run the UI without calling DeepSeek Harness.
 TS_HARNESS_DRY_RUN=true uv run ts-harness-server
 
 # Enable debug/reset controls. Do not use this on shared/public servers.
@@ -119,6 +115,12 @@ Control modes:
 - `TS_HARNESS_CONTROL_MODE=auto`: node transitions are accepted automatically.
 - `TS_HARNESS_CONTROL_MODE=manual`: each node entry and completion waits for browser approval.
 
+### Session Recovery
+
+DSH's append-only session log under `.dsh-sessions/` is the conversation and tool-history source of truth. Each logical main/node actor owns one stable DSH session ID. Every turn opens a fresh runtime process, explicitly creates or resumes that identity, runs one prompt, flushes a durable checkpoint, and closes the process.
+
+Pause uses DSH's native boundary: cancel the root agent, wait until it is idle, drain continuable descendants, flush the session, then acknowledge `paused`. The acknowledged DSH checkpoint sequence is persisted in `state/execution.json` and in the `execution_paused` timeline event. It has no automatic client or server timeout. A separately confirmed force-stop is available only while `pausing`; recovery first resumes the same session so DSH can repair an incomplete tool boundary. If a process died after reserving an identity but before DSH created its log, recovery may create that exact identity only after DSH explicitly reports it absent. Continuing a paused actor requires a non-empty user message; it clears the node's active `pausedAt` marker while retaining the historical pause event in the timeline. `running`, `pausing`, `recovering`, and `failed` executions reject new messages.
+
 ## Ablation Variants
 
 `TS_HARNESS_VARIANT` is read once at process startup. Restart the server to switch variants, and use a different `TS_HARNESS_WORKSPACE` for each experiment.
@@ -140,7 +142,7 @@ Feature codes:
 | `KTL` | `knowledge-to-tools` node and validated reference feature extractor. |
 | `CRV` | Structured case review and case-level attribution. |
 | `CXR` | Structured case review with reference feature extractor execution disabled. |
-| `SUB` | Independent `Task` subagents for candidate testing/review. |
+| `SUB` | Independent candidate testing/review through DSH subagents. |
 | `ADA` | Adaptive iterative solving and stop decisions. |
 | `DIR` | Direct single-agent baseline; cannot be combined with other codes. |
 
@@ -217,6 +219,12 @@ Restart=on-failure
 
 Keep API keys in an environment file with restricted permissions. Put public deployments behind authentication, HTTPS, and network allowlisting.
 
+### Internal MCP Bridge
+
+The DSH MCP bridge is an implementation detail, not a public integration endpoint. For each runner, the server creates a short-lived capability bound to the workspace, session role, node ID, and allowed MCP tools. The bridge calls the loopback-only `/internal/dsh/mcp` endpoint; it is rejected for non-loopback clients.
+
+`DSH_MCP_CONTROL_URL` and `DSH_MCP_CAPABILITY` are reserved internal variables. Cordis forwards them only to the stdio MCP child process, while DSH removes `DSH_*` values from model-executed shell children. Do not expose these values, set them in prompts, or route the internal endpoint through a reverse proxy.
+
 ## Workspaces And Runtime Files
 
 Runtime workspaces are separate from the source repository. By default they live under:
@@ -238,6 +246,7 @@ reports/                    candidate/case/final reports
 knowledge_base/             knowledge graph tables and cache
 state/                      JSON state
 logs/                       JSONL logs
+.dsh-sessions/              durable DSH JSON-RPC session events/checkpoints
 ```
 
 SDK sessions run with `cwd` set to the runtime workspace. Task dependencies should be installed into that workspace, not into the RecursiveECG source repository:

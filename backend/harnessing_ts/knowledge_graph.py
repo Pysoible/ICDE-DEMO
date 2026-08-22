@@ -35,7 +35,7 @@ KG_TOOL_NAMES = [
     "validate_knowledge_base",
     "finalize_knowledge_base",
 ]
-KG_ALLOWED_TOOLS = ["Read", "LS", "Glob", "Grep", *[f"mcp__ts_harness__{name}" for name in KG_TOOL_NAMES]]
+KG_ALLOWED_TOOLS = ["bash", *[f"mcp__ts_harness__{name}" for name in KG_TOOL_NAMES]]
 REFERENCE_FIELDS = ["reference_id", "path", "sha256", "title", "brief", "status", "updated_at"]
 EVIDENCE_FIELDS = ["evidence_id", "reference_file", "page", "section", "quoted_fragments", "notes"]
 KNOWLEDGE_FIELDS = ["knowledge_id", "topic", "description", "summary", "evidence_ids", "class_ids", "relation_ids", "status", "notes"]
@@ -75,22 +75,17 @@ async def build_knowledge_graph(
     sdk_config = build_sdk_invocation_config(llm_config)
     if llm_config.authMode == "manual" and not llm_config.apiKey:
         raise RuntimeError("Knowledge builder LLM config requires apiKey when authMode=manual.")
-    from harnessing_ts.mcp.server import create_harness_mcp_server
-
-    mcp_server = create_harness_mcp_server(
-        session_role="knowledge_builder",
-        knowledge_base_tools=build_knowledge_base_tool_callbacks(store.root, on_change=on_change),
-    )
     runner = SdkRunner(SdkRunnerConfig(
         cwd=workspace_path,
         system_prompt=builder_system_prompt(extraction_depth),
         attachment_text=None,
         allowed_tools=KG_ALLOWED_TOOLS,
         model=sdk_config.model,
+        provider=sdk_config.provider,
+        max_tokens=sdk_config.max_tokens,
         env=sdk_config.env,
-        extra_args=sdk_config.extra_args,
         log=MessageLog(store.knowledge_graph_log_path),
-        mcp_server=mcp_server,
+        session_role="knowledge_builder",
         on_part=on_part,
     ))
     if on_runner:
@@ -150,8 +145,9 @@ async def answer_knowledge_query(
         attachment_text=None,
         allowed_tools=[],
         model=sdk_config.model,
+        provider=sdk_config.provider,
+        max_tokens=sdk_config.max_tokens,
         env=sdk_config.env,
-        extra_args=sdk_config.extra_args,
         log=MessageLog(store.knowledge_reasoning_log_path),
     ))
     try:
@@ -210,10 +206,11 @@ async def answer_reference_query(
         cwd=workspace_path,
         system_prompt=REFERENCE_REASONER_SYSTEM_PROMPT,
         attachment_text=None,
-        allowed_tools=["Read", "LS", "Glob", "Grep"],
+        allowed_tools=["bash"],
         model=sdk_config.model,
+        provider=sdk_config.provider,
+        max_tokens=sdk_config.max_tokens,
         env=sdk_config.env,
-        extra_args=sdk_config.extra_args,
         log=MessageLog(store.knowledge_reasoning_log_path),
     ))
     try:
@@ -288,8 +285,9 @@ async def answer_extractor_source_query(
         attachment_text=None,
         allowed_tools=[],
         model=sdk_config.model,
+        provider=sdk_config.provider,
+        max_tokens=sdk_config.max_tokens,
         env=sdk_config.env,
-        extra_args=sdk_config.extra_args,
         log=MessageLog(store.knowledge_reasoning_log_path),
     ))
     try:
@@ -470,7 +468,7 @@ def extract_reference_text(root: Path, args: dict[str, Any]) -> dict[str, Any]:
         "page_count": page_count,
         "pages": pages,
         "cache_path": cache_path,
-        "note": "" if any(item["char_count"] > 0 for item in pages) else "No text layer extracted by pdftotext. Use SDK Read only as visual fallback or add OCR tooling.",
+        "note": "" if any(item["char_count"] > 0 for item in pages) else "No text layer extracted by pdftotext. Use the DSH bash tool only as a visual fallback or add OCR tooling.",
     }
 
 

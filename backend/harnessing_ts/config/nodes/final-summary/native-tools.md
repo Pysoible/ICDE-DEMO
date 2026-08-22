@@ -1,6 +1,5 @@
-- Read
-- LS
-- Glob
-- Grep
-- Write
-- Edit
+- read
+- glob
+- grep
+- write
+- edit

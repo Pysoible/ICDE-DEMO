@@ -7,9 +7,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from harnessing_ts.config.markdown import read_prompt_text
 from harnessing_ts.state.jsonl import read_json
 
 
@@ -36,17 +35,6 @@ KNOWLEDGE_TO_TOOLS_REQUIRED_OUTPUT_PATHS = tuple(str(path) for path in REFERENCE
     "state/reference-feature-build.json",
 )
 
-# The reference feature extractor is now built directly by the main
-# session during the knowledge-to-tools node. The prompt below is the
-# authoritative build instructions; the main agent reads it (or its
-# inlined summary in the node guidance) and writes the artifacts with
-# Read/LS/Glob/Grep/Write/Edit/Bash. After writing, the main session
-# calls the validate_reference_feature_extractor MCP tool, which
-# invokes validate_reference_feature_extractor() below. The actual
-# build is not driven from this module anymore.
-BUILDER_SYSTEM_PROMPT_PATH = "reference-feature-extractor/system.md"
-BUILDER_BUILD_PROMPT_PATH = "reference-feature-extractor/build.md"
-
 _ALLOWED_IMPORTS = {
     "json", "sys", "math", "statistics", "decimal", "fractions", "collections",
     "itertools", "functools", "typing", "dataclasses", "re", "numpy", "scipy",
@@ -55,15 +43,28 @@ _FORBIDDEN_CALLS = {"eval", "exec", "compile", "open", "input", "breakpoint", "_
 _FORBIDDEN_ATTRS = {"system", "popen", "spawn", "fork", "urandom", "random", "default_rng", "rand", "randn"}
 
 
-def builder_system_prompt() -> str:
-    return read_prompt_text(BUILDER_SYSTEM_PROMPT_PATH)
+class _ValidationProblems:
+    """Collect independent static-contract defects for one repair turn."""
 
+    def __init__(self) -> None:
+        self.errors: list[str] = []
 
-def builder_build_prompt(*, task_files: list[str], references: list[str]) -> str:
-    template = read_prompt_text(BUILDER_BUILD_PROMPT_PATH)
-    return template.replace("{references_json}", json.dumps(references, ensure_ascii=False, indent=2)).replace(
-        "{task_files_json}", json.dumps(task_files, ensure_ascii=False, indent=2)
-    )
+    def add(self, message: str) -> None:
+        if message not in self.errors:
+            self.errors.append(message)
+
+    def check(self, action: Callable[[], None]) -> None:
+        try:
+            action()
+        except RuntimeError as exc:
+            self.add(str(exc))
+
+    def raise_if_any(self) -> None:
+        if self.errors:
+            raise RuntimeError(
+                "Reference feature extractor validation failed:\n"
+                + "\n".join(f"- {message}" for message in self.errors)
+            )
 
 
 def validate_reference_feature_extractor(
@@ -103,42 +104,39 @@ def validate_reference_feature_extractor(
     features = manifest.get("features")
     if not isinstance(features, list) or not features:
         raise RuntimeError("manifest.features must contain at least one feature definition.")
+    problems = _ValidationProblems()
     for feature in features:
         if not isinstance(feature, dict) or not str(feature.get("name", "")).strip():
-            raise RuntimeError("Each manifest feature requires a non-empty name.")
+            problems.add("Each manifest feature requires a non-empty name.")
+            continue
         evidence = feature.get("evidence")
         if not isinstance(evidence, list) or not evidence:
-            raise RuntimeError(f"Feature {feature.get('name')} requires reference evidence.")
+            problems.add(f"Feature {feature.get('name')} requires reference evidence.")
+            continue
         for item in evidence:
-            _validate_reference_evidence_item(item, workspace_path, f"Feature {feature.get('name')}")
-    declared_feature_names = [str(feature.get("name")) for feature in features]
-    _validate_evidence_map(evidence_map, declared_feature_names, workspace_path)
-    _validate_feature_plan(feature_plan, declared_feature_names, workspace_path)
-    _validate_evaluation_report(evaluation_report, declared_feature_names, workspace_path)
-    if not isinstance(rules, dict) or not isinstance(rules.get("features"), list):
-        raise RuntimeError("reference-rules.json must contain a features array.")
-    rule_names = set()
-    for rule in rules["features"]:
-        if not isinstance(rule, dict) or not str(rule.get("name", "")).strip():
-            raise RuntimeError("Each reference rule requires a name.")
-        if not str(rule.get("computation", "")).strip() or not isinstance(rule.get("judgments"), list):
-            raise RuntimeError(f"Reference rule {rule.get('name')} requires computation and judgments.")
-        if not isinstance(rule.get("evidence"), list) or not rule["evidence"]:
-            raise RuntimeError(f"Reference rule {rule.get('name')} requires evidence.")
-        rule_names.add(str(rule["name"]))
-    missing_rules = [str(feature.get("name")) for feature in features if str(feature.get("name")) not in rule_names]
-    if missing_rules:
-        raise RuntimeError("Features missing from reference-rules.json: " + ", ".join(missing_rules))
+            problems.check(lambda item=item, name=feature["name"]: _validate_reference_evidence_item(
+                item, workspace_path, f"Feature {name}"
+            ))
+    declared_feature_names = [
+        str(feature["name"])
+        for feature in features
+        if isinstance(feature, dict) and str(feature.get("name", "")).strip()
+    ]
+    _validate_evidence_map(evidence_map, declared_feature_names, workspace_path, problems)
+    _validate_feature_plan(feature_plan, declared_feature_names, workspace_path, problems)
+    _validate_evaluation_report(evaluation_report, declared_feature_names, workspace_path, problems)
+    _validate_reference_rules(rules, declared_feature_names, problems)
     if not isinstance(tests, list) or not tests:
-        raise RuntimeError("test-cases.json must contain at least one deterministic example.")
-    if not any(_is_real_sample_test_case(workspace_path, case) for case in tests if isinstance(case, dict)):
-        raise RuntimeError(
+        problems.add("test-cases.json must contain at least one deterministic example.")
+    elif not any(_is_real_sample_test_case(workspace_path, case) for case in tests if isinstance(case, dict)):
+        problems.add(
             "test-cases.json must contain at least one real workspace sample with "
             "source.type=real_sample and an existing workspace-relative source.path."
         )
 
     source = (workspace_path / SOURCE_PATH).read_text(encoding="utf-8")
-    _validate_deterministic_source(source)
+    problems.check(lambda: _validate_deterministic_source(source))
+    problems.raise_if_any()
     result = {
         "ready": True,
         "toolDir": str(TOOL_DIR),
@@ -177,113 +175,165 @@ def validate_reference_feature_extractor(
     return result
 
 
-def _validate_evidence_map(evidence_map: Any, declared_feature_names: list[str], workspace_path: Path) -> None:
+def _validate_evidence_map(
+    evidence_map: Any,
+    declared_feature_names: list[str],
+    workspace_path: Path,
+    problems: _ValidationProblems,
+) -> None:
     if not isinstance(evidence_map, dict) or evidence_map.get("schemaVersion") != "1.0":
-        raise RuntimeError("evidence-map.json must be an object with schemaVersion=1.0.")
+        problems.add("evidence-map.json must be an object with schemaVersion=1.0.")
+        return
     entries = evidence_map.get("features")
     if not isinstance(entries, list) or not entries:
-        raise RuntimeError("evidence-map.json must contain a non-empty features array.")
+        problems.add("evidence-map.json must contain a non-empty features array.")
+        return
     mapped: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict):
-            raise RuntimeError("Each evidence-map feature must be an object.")
+            problems.add("Each evidence-map feature must be an object.")
+            continue
         name = str(entry.get("name") or entry.get("candidateName") or "").strip()
         if not name:
-            raise RuntimeError("Each evidence-map feature requires name.")
+            problems.add("Each evidence-map feature requires name.")
+            continue
         mapped.add(name)
         evidence = entry.get("evidence")
         if not isinstance(evidence, list) or not evidence:
-            raise RuntimeError(f"Evidence-map feature {name} requires evidence.")
+            problems.add(f"Evidence-map feature {name} requires evidence.")
+            continue
         for item in evidence:
-            _validate_reference_evidence_item(item, workspace_path, f"Evidence-map feature {name}")
+            problems.check(lambda item=item, name=name: _validate_reference_evidence_item(
+                item, workspace_path, f"Evidence-map feature {name}"
+            ))
     missing = sorted(set(declared_feature_names) - mapped)
     if missing:
-        raise RuntimeError("evidence-map.json is missing manifest features: " + ", ".join(missing))
+        problems.add("evidence-map.json is missing manifest features: " + ", ".join(missing))
 
 
-def _validate_feature_plan(feature_plan: Any, declared_feature_names: list[str], workspace_path: Path) -> None:
+def _validate_feature_plan(
+    feature_plan: Any,
+    declared_feature_names: list[str],
+    workspace_path: Path,
+    problems: _ValidationProblems,
+) -> None:
     if not isinstance(feature_plan, dict) or feature_plan.get("schemaVersion") != "1.0":
-        raise RuntimeError("feature-plan.json must be an object with schemaVersion=1.0.")
+        problems.add("feature-plan.json must be an object with schemaVersion=1.0.")
+        return
     entries = feature_plan.get("features")
     if not isinstance(entries, list) or not entries:
-        raise RuntimeError("feature-plan.json must contain a non-empty features array.")
+        problems.add("feature-plan.json must contain a non-empty features array.")
+        return
     planned: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict):
-            raise RuntimeError("Each feature-plan feature must be an object.")
+            problems.add("Each feature-plan feature must be an object.")
+            continue
         name = str(entry.get("name") or "").strip()
         if not name:
-            raise RuntimeError("Each feature-plan feature requires name.")
+            problems.add("Each feature-plan feature requires name.")
+            continue
         planned.add(name)
         if not str(entry.get("computation") or "").strip():
-            raise RuntimeError(f"Feature-plan feature {name} requires computation.")
+            problems.add(f"Feature-plan feature {name} requires computation.")
         if not str(entry.get("unit") or "").strip():
-            raise RuntimeError(f"Feature-plan feature {name} requires unit.")
+            problems.add(f"Feature-plan feature {name} requires unit.")
         if not str(entry.get("controlExpectation") or "").strip():
-            raise RuntimeError(f"Feature-plan feature {name} requires controlExpectation.")
+            problems.add(f"Feature-plan feature {name} requires controlExpectation.")
         if not isinstance(entry.get("expectedFailureModes"), list) or not entry["expectedFailureModes"]:
-            raise RuntimeError(f"Feature-plan feature {name} requires expectedFailureModes.")
+            problems.add(f"Feature-plan feature {name} requires expectedFailureModes.")
         judgments = entry.get("judgmentRules") or entry.get("judgments")
         if not isinstance(judgments, list) or not judgments:
-            raise RuntimeError(f"Feature-plan feature {name} requires judgmentRules.")
+            problems.add(f"Feature-plan feature {name} requires judgmentRules.")
         evidence = entry.get("evidence")
         if not isinstance(evidence, list) or not evidence:
-            raise RuntimeError(f"Feature-plan feature {name} requires evidence.")
+            problems.add(f"Feature-plan feature {name} requires evidence.")
+            continue
         for item in evidence:
-            _validate_reference_evidence_item(item, workspace_path, f"Feature-plan feature {name}")
+            problems.check(lambda item=item, name=name: _validate_reference_evidence_item(
+                item, workspace_path, f"Feature-plan feature {name}"
+            ))
     missing = sorted(set(declared_feature_names) - planned)
     if missing:
-        raise RuntimeError("feature-plan.json is missing manifest features: " + ", ".join(missing))
+        problems.add("feature-plan.json is missing manifest features: " + ", ".join(missing))
 
 
 def _validate_evaluation_report(
     evaluation_report: Any,
     declared_feature_names: list[str],
     workspace_path: Path,
+    problems: _ValidationProblems,
 ) -> None:
     if not isinstance(evaluation_report, dict) or evaluation_report.get("schemaVersion") != "1.0":
-        raise RuntimeError("evaluation-report.json must be an object with schemaVersion=1.0.")
+        problems.add("evaluation-report.json must be an object with schemaVersion=1.0.")
+        return
     cases = evaluation_report.get("cases")
     if not isinstance(cases, list) or not cases:
-        raise RuntimeError("evaluation-report.json must contain a non-empty cases array.")
+        problems.add("evaluation-report.json must contain a non-empty cases array.")
+        return
     try:
         declared_control_count = int(evaluation_report.get("controlCaseCount") or 0)
     except (TypeError, ValueError):
-        raise RuntimeError("evaluation-report.json controlCaseCount must be an integer.") from None
+        problems.add("evaluation-report.json controlCaseCount must be an integer.")
+        declared_control_count = 0
     observed_control_count = 0
     evaluated_features: set[str] = set()
     for index, case in enumerate(cases):
         if not isinstance(case, dict):
-            raise RuntimeError(f"evaluation-report.json case {index} must be an object.")
+            problems.add(f"evaluation-report.json case {index} must be an object.")
+            continue
         if _is_real_sample_test_case(workspace_path, case):
             pass
         else:
             source_case = {"source": case.get("source") or case.get("sampleSource")}
             if not _is_real_sample_test_case(workspace_path, source_case):
-                raise RuntimeError(f"evaluation-report.json case {index} requires a real sample source.")
+                problems.add(f"evaluation-report.json case {index} requires a real sample source.")
         role = str(case.get("role") or case.get("caseRole") or "").casefold()
         if case.get("isControl") is True or role in {"control", "normal", "baseline", "reference", "negative"}:
             observed_control_count += 1
         counts = case.get("featureStatusCounts") or case.get("judgmentDistribution")
         if not isinstance(counts, dict) or not counts:
-            raise RuntimeError(f"evaluation-report.json case {index} requires featureStatusCounts.")
+            problems.add(f"evaluation-report.json case {index} requires featureStatusCounts.")
         features = case.get("features")
         if isinstance(features, list):
             for feature in features:
                 if isinstance(feature, dict) and str(feature.get("name") or "").strip():
                     evaluated_features.add(str(feature["name"]))
     if observed_control_count < 1:
-        raise RuntimeError("evaluation-report.json must include at least one control/reference case.")
+        problems.add("evaluation-report.json must include at least one control/reference case.")
     if declared_control_count and declared_control_count != observed_control_count:
-        raise RuntimeError("evaluation-report.json controlCaseCount does not match observed control/reference cases.")
+        problems.add("evaluation-report.json controlCaseCount does not match observed control/reference cases.")
     missing = sorted(set(declared_feature_names) - evaluated_features)
     if missing:
-        raise RuntimeError("evaluation-report.json is missing evaluated features: " + ", ".join(missing))
+        problems.add("evaluation-report.json is missing evaluated features: " + ", ".join(missing))
     summary = evaluation_report.get("summary")
     if not isinstance(summary, dict):
-        raise RuntimeError("evaluation-report.json requires a summary object.")
-    if "controlCaseWarnings" not in summary or not isinstance(summary["controlCaseWarnings"], list):
-        raise RuntimeError("evaluation-report.json summary requires controlCaseWarnings array.")
+        problems.add("evaluation-report.json requires a summary object.")
+    elif "controlCaseWarnings" not in summary or not isinstance(summary["controlCaseWarnings"], list):
+        problems.add("evaluation-report.json summary requires controlCaseWarnings array.")
+
+
+def _validate_reference_rules(
+    rules: Any,
+    declared_feature_names: list[str],
+    problems: _ValidationProblems,
+) -> None:
+    if not isinstance(rules, dict) or not isinstance(rules.get("features"), list):
+        problems.add("reference-rules.json must contain a features array.")
+        return
+    rule_names = set()
+    for rule in rules["features"]:
+        if not isinstance(rule, dict) or not str(rule.get("name", "")).strip():
+            problems.add("Each reference rule requires a name.")
+            continue
+        if not str(rule.get("computation", "")).strip() or not isinstance(rule.get("judgments"), list):
+            problems.add(f"Reference rule {rule.get('name')} requires computation and judgments.")
+        if not isinstance(rule.get("evidence"), list) or not rule["evidence"]:
+            problems.add(f"Reference rule {rule.get('name')} requires evidence.")
+        rule_names.add(str(rule["name"]))
+    missing = sorted(set(declared_feature_names) - rule_names)
+    if missing:
+        problems.add("Features missing from reference-rules.json: " + ", ".join(missing))
 
 
 def _validate_reference_evidence_item(item: Any, workspace_path: Path, label: str) -> None:

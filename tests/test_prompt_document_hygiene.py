@@ -48,7 +48,7 @@ def test_docs_and_prompts_do_not_contain_runtime_residue() -> None:
     assert offenders == []
 
 
-def test_common_node_rules_do_not_forbid_task_when_node_allows_it() -> None:
+def test_common_node_rules_allow_subagents_only_when_node_contract_exposes_them() -> None:
     common_rules = (
         REPO_ROOT
         / "backend"
@@ -59,8 +59,8 @@ def test_common_node_rules_do_not_forbid_task_when_node_allows_it() -> None:
         / "execution-rules.md"
     ).read_text(encoding="utf-8")
 
-    assert "不要用 Task 子代理" not in common_rules
-    assert "只有当本 node 规范明确允许或要求 `Task` 时" in common_rules
+    assert "`Task`" not in common_rules
+    assert "只有 native-tool 清单出现 `subagent` / `subagent_fork` 时才可委派" in common_rules
 
 
 def test_common_node_rules_allow_only_native_and_injected_harness_tools() -> None:
@@ -74,7 +74,7 @@ def test_common_node_rules_allow_only_native_and_injected_harness_tools() -> Non
         / "execution-rules.md"
     ).read_text(encoding="utf-8")
 
-    assert "只能使用本 node 的 native tools，以及系统明确注入的 Harness MCP 工具" in common_rules
+    assert "只能使用本 node 的 native DSH tools，以及系统明确注入的 Harness MCP 工具" in common_rules
 
 
 def test_shared_prompt_contains_universal_reliability_rules() -> None:
@@ -154,33 +154,16 @@ def test_final_summary_prompt_does_not_request_impossible_failure_reroute() -> N
 
 def test_knowledge_to_tools_requires_real_sample_validation() -> None:
     guidance = node_document("knowledge-to-tools")["guidance"]
-    system_prompt = (
-        REPO_ROOT
-        / "backend"
-        / "harnessing_ts"
-        / "config"
-        / "prompts"
-        / "reference-feature-extractor"
-        / "system.md"
-    ).read_text(encoding="utf-8")
-    build_prompt = (
-        REPO_ROOT
-        / "backend"
-        / "harnessing_ts"
-        / "config"
-        / "prompts"
-        / "reference-feature-extractor"
-        / "build.md"
-    ).read_text(encoding="utf-8")
-
-    for text in (guidance, system_prompt, build_prompt):
-        assert "真实样本" in text
-        assert "合成样本只能作为补充" in text
-        assert "evaluation-report.json" in text
+    assert "真实样本" in guidance
+    assert "合成样本只能作为补充" in guidance
+    assert "evaluation-report.json" in guidance
     assert "evidence-map.json" in guidance
     assert "feature-plan.json" in guidance
     assert "test-cases.json" in guidance
     assert "source" in guidance
+    assert "referencePath` **只能**是存在的 `references/**`" in guidance
+    assert "{runTests: false}" in guidance
+    assert "由后端校验工具写入" in guidance
 
 
 def test_iterative_case_review_visualization_contract_is_explicit() -> None:

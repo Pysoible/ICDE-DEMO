@@ -212,6 +212,28 @@ def test_rejects_evaluation_report_without_control_case(tmp_path) -> None:
         validate_reference_feature_extractor(tmp_path)
 
 
+def test_static_preflight_reports_independent_contract_errors_together(tmp_path) -> None:
+    _write_extractor(tmp_path)
+    tool = tmp_path / "tools" / "reference-feature-extractor"
+    manifest = json.loads((tool / "manifest.json").read_text(encoding="utf-8"))
+    manifest["features"][0]["evidence"][0]["referencePath"] = "user/problem-contract.md"
+    (tool / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (tool / "test-cases.json").write_text(json.dumps([{"input": {"pr_ms": 220}}]), encoding="utf-8")
+    report = json.loads((tool / "evaluation-report.json").read_text(encoding="utf-8"))
+    report["cases"][0]["role"] = "analysis"
+    report["cases"][0]["isControl"] = False
+    (tool / "evaluation-report.json").write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        validate_reference_feature_extractor(tmp_path, run_tests=False)
+
+    message = str(exc_info.value)
+    assert "validation failed" in message
+    assert "Feature PR interval has invalid referencePath: user/problem-contract.md" in message
+    assert "test-cases.json must contain at least one real workspace sample" in message
+    assert "evaluation-report.json must include at least one control/reference case." in message
+
+
 def test_rejects_extractor_output_without_warnings_array(tmp_path) -> None:
     _write_extractor(tmp_path)
     source = tmp_path / "tools" / "reference-feature-extractor" / "extractor.py"

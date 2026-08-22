@@ -37,7 +37,7 @@ class HarnessPromptAgent(agl.LitAgent):
     def training_rollout(self, task: TimeSeriesHarnessTask, rollout_id: str, resources: agl.NamedResources) -> float:
         prompt_template: agl.PromptTemplate = resources["main_prompt"]
         prompt = prompt_template.template.format(user_request=task["user_request"])
-        # Wire this to a dry-run HarnessingTS invocation, a real Claude Code SDK run,
+        # Wire this to a dry-run HarnessingTS invocation or a real DeepSeek Harness run,
         # or a saved transcript replay depending on the training target.
         final_answer = prompt
         return grade_harness_output(final_answer, task["expected_behavior"])

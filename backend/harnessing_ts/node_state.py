@@ -78,9 +78,23 @@ class NodeStateMachine:
         goal_met: bool | None = None,
         next_node_specified: bool = False,
     ) -> None:
+        if node_type == "problem-contract":
+            if success:
+                self._validate_required_paths(output_paths or [], {
+                    "problem contract": r"^user/problem-contract\.md$",
+                    "data spec": r"^user/data-spec\.md$",
+                }, "problem-contract")
+            return
         if node_type == "knowledge-to-tools":
             if success:
                 self.validate_knowledge_to_tools_output_paths(output_paths or [])
+            return
+        if node_type == "final-summary":
+            if success:
+                self._validate_required_paths(output_paths or [], {
+                    "final summary": r"^reports/final-summary\.md$",
+                    "final solution": r"^user/final-solution\.md$",
+                }, "final-summary")
             return
         if node_type != "iterative-solving":
             return
@@ -167,6 +181,14 @@ class NodeStateMachine:
                 "knowledge-to-tools finish_node is missing required outputPaths: "
                 + ", ".join(missing)
                 + ". Complete the full reference feature extractor contract before calling finish_node."
+            )
+
+    def _validate_required_paths(self, output_paths: list[str], requirements: dict[str, str], node_type: str) -> None:
+        normalized = [_workspace_relative_path(path, self.workspace_path) for path in output_paths]
+        missing = [label for label, pattern in requirements.items() if not any(re.match(pattern, path) for path in normalized)]
+        if missing:
+            raise RuntimeError(
+                f"{node_type} finish_node is missing required outputPaths: " + ", ".join(missing) + "."
             )
 
     def iterative_route_decision(self, next_node: NodeType | None, loop_decision: str | None) -> str | None:

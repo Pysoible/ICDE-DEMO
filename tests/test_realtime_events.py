@@ -34,7 +34,7 @@ def test_realtime_broker_drops_oldest_event_for_slow_subscriber() -> None:
     assert queue.get_nowait() == latest
 
 
-def test_main_part_event_contains_collapsed_persisted_transcript(tmp_path) -> None:
+def test_main_part_event_contains_incremental_part(tmp_path) -> None:
     orchestrator = HarnessOrchestrator(tmp_path)
     orchestrator.initialize()
     events: list[tuple[str, dict]] = []
@@ -45,7 +45,8 @@ def test_main_part_event_contains_collapsed_persisted_transcript(tmp_path) -> No
     orchestrator._emit_main_parts(part)
 
     assert events[-1][0] == "main_parts"
-    assert events[-1][1]["mainParts"][0]["text"] == "hello"
+    assert events[-1][1]["mainPart"]["text"] == "hello"
+    assert "mainParts" not in events[-1][1]
 
 
 def test_unchanged_visible_main_transcript_is_not_republished(tmp_path) -> None:
@@ -62,6 +63,52 @@ def test_unchanged_visible_main_transcript_is_not_republished(tmp_path) -> None:
     assert [kind for kind, _payload in events] == ["main_parts"]
 
 
+def test_tool_card_status_update_is_republished_for_the_same_part_id(tmp_path) -> None:
+    orchestrator = HarnessOrchestrator(tmp_path)
+    orchestrator.initialize()
+    events: list[tuple[str, dict]] = []
+    orchestrator.set_realtime_event_sink(lambda kind, payload: events.append((kind, payload)))
+    pending = {
+        "id": "tool-1",
+        "role": "assistant",
+        "type": "tool_call",
+        "name": "bash",
+        "status": "pending",
+    }
+    completed = {**pending, "status": "completed", "resultText": "ok"}
+
+    orchestrator._emit_main_parts(pending)
+    orchestrator._emit_main_parts(completed)
+    orchestrator._emit_main_parts(completed)
+
+    assert [kind for kind, _payload in events] == ["main_parts", "main_parts"]
+    assert events[-1][1]["mainPart"]["id"] == "tool-1"
+    assert events[-1][1]["mainPart"]["status"] == "completed"
+
+
+def test_node_tool_card_status_update_is_republished_for_the_same_part_id(tmp_path) -> None:
+    orchestrator = HarnessOrchestrator(tmp_path)
+    orchestrator.initialize()
+    events: list[tuple[str, dict]] = []
+    orchestrator.set_realtime_event_sink(lambda kind, payload: events.append((kind, payload)))
+    node = orchestrator.store.create_node_session("knowledge-to-tools")
+    pending = {
+        "id": "tool-1",
+        "role": "assistant",
+        "type": "tool_call",
+        "name": "mcp__ts_harness__validate_reference_feature_extractor",
+        "status": "pending",
+    }
+    completed = {**pending, "status": "completed", "resultText": "validated"}
+
+    orchestrator._emit_node_parts(node["id"], pending)
+    orchestrator._emit_node_parts(node["id"], completed)
+    orchestrator._emit_node_parts(node["id"], completed)
+
+    assert [kind for kind, _payload in events] == ["node_parts", "node_parts"]
+    assert events[-1][1]["nodePartById"][node["id"]]["status"] == "completed"
+
+
 def test_chain_summary_part_event_is_realtime_and_deduplicated(tmp_path) -> None:
     orchestrator = HarnessOrchestrator(tmp_path)
     orchestrator.initialize()
@@ -74,7 +121,7 @@ def test_chain_summary_part_event_is_realtime_and_deduplicated(tmp_path) -> None
     orchestrator._emit_chain_summary_parts(part)
 
     assert [kind for kind, _payload in events] == ["chain_summary_parts"]
-    assert events[0][1]["chainSummaryParts"][0]["text"] == "build summary"
+    assert events[0][1]["chainSummaryPart"]["text"] == "build summary"
 
 
 def test_chain_summary_builder_receives_realtime_part_callback(tmp_path) -> None:
@@ -90,7 +137,7 @@ def test_chain_summary_builder_receives_realtime_part_callback(tmp_path) -> None
     assert build.call_args.kwargs["on_part"] == orchestrator._emit_chain_summary_parts
 
 
-def test_node_part_event_contains_session_transcript_and_state(tmp_path) -> None:
+def test_node_part_event_contains_incremental_part_and_state(tmp_path) -> None:
     orchestrator = HarnessOrchestrator(tmp_path)
     orchestrator.initialize()
     events: list[tuple[str, dict]] = []
@@ -102,7 +149,7 @@ def test_node_part_event_contains_session_transcript_and_state(tmp_path) -> None
     orchestrator._emit_node_parts(node["id"], part)
 
     assert events[-1][0] == "node_parts"
-    assert events[-1][1]["nodePartsById"][node["id"]][0]["text"] == "execute node"
+    assert events[-1][1]["nodePartById"][node["id"]]["text"] == "execute node"
     assert events[-1][1]["nodes"][0]["id"] == node["id"]
 
 

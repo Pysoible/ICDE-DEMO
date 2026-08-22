@@ -148,10 +148,8 @@ def test_validate_chain_summary_rejects_english_user_facing_content(tmp_path) ->
 
 
 def test_chain_builder_separates_generate_and_repair_tools() -> None:
-    assert "Write" in CHAIN_GENERATE_TOOLS
-    assert "Edit" not in CHAIN_GENERATE_TOOLS
-    assert "Edit" in CHAIN_REPAIR_TOOLS
-    assert "Write" not in CHAIN_REPAIR_TOOLS
+    assert CHAIN_GENERATE_TOOLS == ["bash"]
+    assert CHAIN_REPAIR_TOOLS == ["bash"]
     assert CHAIN_MAX_REPAIR_ATTEMPTS == 6
 
 

@@ -8,8 +8,6 @@ from harnessing_ts.config.markdown import node_documents
 NodeType = str
 ControlMode = Literal["manual", "auto"]
 CONTROL_MODES: tuple[str, ...] = ("manual", "auto")
-ResumeMode = Literal["new_session", "resume_keep", "resume_rollback"]
-RESUME_MODES: tuple[str, ...] = ("new_session", "resume_keep", "resume_rollback")
 
 
 @dataclass(frozen=True)
@@ -52,12 +50,12 @@ class WorkspaceState(TypedDict):
     activeNodeSessionId: str | None
     completedNodes: list[NodeType]
     contractConfirmed: bool
+    contractReady: bool
     finalSummaryConfirmed: bool
     runtimeSettings: "RuntimeSettings"
     variantId: str
     variantName: str
     mainSdkSessionId: str | None
-    mainResumeMode: ResumeMode
 
 
 class RuntimeSettings(TypedDict):
@@ -72,7 +70,6 @@ class NodeSession(TypedDict, total=False):
     startedAt: str
     completedAt: str
     sdkSessionId: str
-    resumeMode: ResumeMode
     rationale: str
     inputSummary: str
     summary: str
@@ -84,6 +81,8 @@ class NodeSession(TypedDict, total=False):
     outputPaths: list[str]
     protocolReminders: int
     protocolReminderReason: str
+    pausedAt: str
+    runEpoch: int
 
 
 class ControlRequest(TypedDict, total=False):
@@ -116,7 +115,7 @@ class Part(TypedDict, total=False):
     input: Any
     intend: str
     toolUseId: str
-    status: Literal["pending", "completed"]
+    status: Literal["pending", "completed", "failed"]
     resultText: str
     resultRaw: Any
     raw: Any

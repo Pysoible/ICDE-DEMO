@@ -393,19 +393,6 @@ wheels = [
 ]
 
 [[package]]
-name = "claude-code-sdk"
-version = "0.0.25"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "anyio" },
-    { name = "mcp" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/ec/0d/0f4a71415826578a5ace16817c52df84d76ffbda5cdad02f520a2b963bde/claude_code_sdk-0.0.25.tar.gz", hash = "sha256:0d9e1eba432d4fe8a2f75f06ec9bb4c310f39b1d55246e7e4b2c69bfdd69eab3", size = 41273, upload-time = "2025-09-29T20:14:51.882Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f5/41/c934058080f3233bbc95bc9abac5e0191bf336ad5f69a33b5f54a4737e88/claude_code_sdk-0.0.25-py3-none-any.whl", hash = "sha256:3d6a4ef958182f311d6050776d2675d9b39650a2db221c582a0a5156472dcee3", size = 31031, upload-time = "2025-09-29T20:14:50.687Z" },
-]
-
-[[package]]
 name = "click"
 version = "8.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -483,6 +470,28 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/3b/f2/5a72274ca9f1b2a8b44a662ee0bf1b435909deb473d6f97bcd035bcdbc71/cryptography-48.0.0-pp311-pypy311_pp73-manylinux_2_34_aarch64.whl", hash = "sha256:ecde28a596bead48b0cfd2a1b4416c3d43074c2d785e3a398d7ec1fc4d0f7fbb", size = 4636797, upload-time = "2026-05-04T22:59:24.912Z" },
     { url = "https://files.pythonhosted.org/packages/b4/e1/48cedb2fe63626e91ded1edad159e2a4fb8b6906c4425eb7749673077ce7/cryptography-48.0.0-pp311-pypy311_pp73-manylinux_2_34_x86_64.whl", hash = "sha256:4defde8685ae324a9eb9d818717e93b4638ef67070ac9bc15b8ca85f63048355", size = 4666800, upload-time = "2026-05-04T22:59:27.474Z" },
     { url = "https://files.pythonhosted.org/packages/a2/ca/7e8365deec19afb2b2c7be7c1c0aa8f99633b54e90c570999acda93260fc/cryptography-48.0.0-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:db63bf618e5dea46c07de12e900fe1cdd2541e6dc9dbae772a70b7d4d4765f6a", size = 3739536, upload-time = "2026-05-04T22:59:29.61Z" },
+]
+
+[[package]]
+name = "deepseek-harness-runtime-bin"
+version = "0.1.0rc7"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/03/6e/c7d6992c148312a9abee04115802a44eb474d9dd5464cc6856b14518bc8a/deepseek_harness_runtime_bin-0.1.0rc7-py3-none-macosx_14_0_arm64.whl", hash = "sha256:39ae51dec905c496ede69250d51b02a424a6c96829feb2ad7e01b3cec97a3255", size = 52067269, upload-time = "2026-08-18T02:04:29.222Z" },
+    { url = "https://files.pythonhosted.org/packages/10/64/86796e0394b577741850c6818e8dad8e13afc38c9b4692c7b4738045916f/deepseek_harness_runtime_bin-0.1.0rc7-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:de4e2571d3cd1c521ee22c754460dd251b45bd91a033876f554d0eab9b2843a1", size = 56534076, upload-time = "2026-08-18T02:04:32.529Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/f1/91501f0f08949fbc592f790a1a1a327ff781fe35138765eac38afb77c433/deepseek_harness_runtime_bin-0.1.0rc7-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:bf26f76a8cab7bedcce3a060b81d19ec1cabd8bd261c40b47381d630742797a7", size = 56796555, upload-time = "2026-08-18T02:04:35.677Z" },
+]
+
+[[package]]
+name = "deepseek-harness-sdk"
+version = "0.1.0rc7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "deepseek-harness-runtime-bin" },
+    { name = "pydantic" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/51/5e/86d118a15ad0f5b42933fb7162420b60b7cc53a4739da272a5204501e009/deepseek_harness_sdk-0.1.0rc7-py3-none-any.whl", hash = "sha256:5327d60659d8802442d2c589c89c3528cf18eb07b5d698059c833eb6b853b7d4", size = 12881, upload-time = "2026-08-18T02:05:09.933Z" },
 ]
 
 [[package]]
@@ -668,8 +677,9 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
-    { name = "claude-code-sdk" },
+    { name = "deepseek-harness-sdk" },
     { name = "fastapi" },
+    { name = "mcp" },
     { name = "pydantic" },
     { name = "python-docx" },
     { name = "python-multipart" },
@@ -692,8 +702,9 @@ dev = [
 requires-dist = [
     { name = "agentlightning", marker = "extra == 'training'", specifier = ">=0.1.0" },
     { name = "anyio", specifier = ">=4.9,<4.11" },
-    { name = "claude-code-sdk", specifier = ">=0.0.22" },
+    { name = "deepseek-harness-sdk", specifier = ">=0.1.0rc7,<0.2" },
     { name = "fastapi", specifier = ">=0.116.0,<0.136.0" },
+    { name = "mcp", specifier = ">=1.27,<2" },
     { name = "openai", marker = "extra == 'training'", specifier = ">=1.100.0" },
     { name = "pydantic", specifier = ">=2.10.0" },
     { name = "python-docx", specifier = ">=1.1.2" },

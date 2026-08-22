@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import mimetypes
 import os
 import socket
@@ -9,7 +10,7 @@ from typing import Any, Literal
 from urllib.parse import unquote
 
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -30,9 +31,16 @@ class ClearLogsRequest(BaseModel):
     confirmReset: bool = False
 
 
-class InterruptRequest(BaseModel):
+class WorkflowResetRequest(BaseModel):
+    preserveAssets: bool = True
+
+
+class PauseRequest(BaseModel):
     reason: str | None = None
-    resumeMode: Literal["new_session", "resume_keep", "resume_rollback"] = "new_session"
+
+
+class ForceStopRequest(BaseModel):
+    confirm: bool = False
 
 
 class ControlDecisionRequest(BaseModel):
@@ -58,7 +66,6 @@ class KnowledgeGraphLlmConfigRequest(BaseModel):
     model: str | None = None
     apiKey: str | None = None
     baseUrl: str | None = None
-    contextWindow: str | None = None
 
 
 class ReferenceFeatureBuildRequest(BaseModel):
@@ -75,7 +82,6 @@ class MainLlmConfigRequest(BaseModel):
     model: str | None = None
     apiKey: str | None = None
     baseUrl: str | None = None
-    contextWindow: str | None = None
 
 
 class KnowledgeQueryRequest(BaseModel):
@@ -84,6 +90,14 @@ class KnowledgeQueryRequest(BaseModel):
     context: dict[str, Any] | None = None
     observations: list[str] | None = None
     includeEvidence: bool = False
+
+
+class DshMcpControlRequest(BaseModel):
+    workspace: str
+    role: str
+    nodeSessionId: str | None = None
+    tool: str
+    args: dict[str, Any] = {}
 
 
 def create_app() -> FastAPI:
@@ -98,7 +112,23 @@ def create_app() -> FastAPI:
     orchestrator = HarnessOrchestrator(workspace_path, dry_run=dry_run, locale="zh", mode=control_mode)
     orchestrator.initialize(reporter=_startup_report)
     _print_ready_urls()
-    app = FastAPI(title="HarnessingTS")
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            await orchestrator.complete_interrupted_recovery()
+            yield
+        finally:
+            # asyncio tasks and MCP capabilities are process-local. Persist
+            # an explicit paused state before Uvicorn tears the process down.
+            try:
+                # Server shutdown follows the same native DSH checkpoint
+                # boundary as an explicit user pause.
+                if orchestrator.execution.snapshot()["phase"] == "running":
+                    await orchestrator.interrupt_current("Harness server is shutting down.")
+            finally:
+                await orchestrator.close()
+
+    app = FastAPI(title="HarnessingTS", lifespan=lifespan)
     realtime = RealtimeEventBroker()
     orchestrator.set_realtime_event_sink(realtime.publish)
     app.state.orchestrator = orchestrator
@@ -109,6 +139,15 @@ def create_app() -> FastAPI:
     app.state.run_task = None
     app.state.knowledge_graph_task = None
     app.state.chain_summary_task = None
+    app.state.pause_task = None
+    orchestrator.set_runtime_snapshot_provider(lambda: _live(orchestrator))
+    control_url = os.getenv("DSH_MCP_CONTROL_URL", "").strip()
+    if not control_url:
+        # DSH's MCP process is a local child of this server.  It must never
+        # discover the public listening address or inherit a user-facing URL.
+        control_url = f"http://127.0.0.1:{_startup_port()}"
+    orchestrator.configure_mcp_control(control_url)
+    orchestrator.recover_interrupted_execution()
 
     @app.middleware("http")
     async def no_store_cache(request: Any, call_next: Any) -> Any:
@@ -191,6 +230,32 @@ def create_app() -> FastAPI:
     async def runtime_settings() -> dict[str, Any]:
         return orchestrator.get_runtime_settings()
 
+    @app.post("/internal/dsh/mcp")
+    async def dsh_mcp_control(
+        request: Request,
+        payload: DshMcpControlRequest,
+    ) -> Any:
+        client_host = request.client.host if request.client else ""
+        if client_host not in {"127.0.0.1", "::1", "testclient"}:
+            raise HTTPException(status_code=403, detail="DSH MCP control endpoint is loopback-only.")
+        capability = request.headers.get("x-ts-harness-capability", "")
+        if not capability:
+            raise HTTPException(status_code=401, detail="Missing DSH MCP capability.")
+        try:
+            result = await orchestrator.dispatch_dsh_mcp_call(
+                capability=capability,
+                workspace=payload.workspace,
+                role=payload.role,
+                node_session_id=payload.nodeSessionId,
+                tool=payload.tool,
+                args=payload.args,
+            )
+            return result
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from None
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
     @app.post("/api/runtime-settings")
     async def update_runtime_settings(request: RuntimeSettingsRequest) -> dict[str, Any]:
         settings = orchestrator.update_runtime_settings(request.model_dump(exclude_none=True))
@@ -265,7 +330,7 @@ def create_app() -> FastAPI:
         return {"accepted": accepted, "bootstrap": _bootstrap(orchestrator, workspace_path, dry_run, debug_enabled)}
 
     @app.post("/api/knowledge-graph/pause")
-    async def pause_knowledge_graph_build(request: InterruptRequest) -> dict[str, Any]:
+    async def pause_knowledge_graph_build(request: PauseRequest) -> dict[str, Any]:
         await orchestrator.pause_knowledge_graph_build(request.reason)
         realtime.publish("live_snapshot", {"snapshot": _live(orchestrator)})
         return {"bootstrap": _bootstrap(orchestrator, workspace_path, dry_run, debug_enabled)}
@@ -310,7 +375,7 @@ def create_app() -> FastAPI:
         return {"accepted": accepted, "bootstrap": _bootstrap(orchestrator, workspace_path, dry_run, debug_enabled)}
 
     @app.post("/api/chain-summary/pause")
-    async def pause_chain_summary_build(request: InterruptRequest) -> dict[str, Any]:
+    async def pause_chain_summary_build(request: PauseRequest) -> dict[str, Any]:
         await orchestrator.pause_chain_summary_build(request.reason)
         realtime.publish("live_snapshot", {"snapshot": _live(orchestrator)})
         return {"bootstrap": _bootstrap(orchestrator, workspace_path, dry_run, debug_enabled)}
@@ -412,26 +477,69 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="text required")
         current = app.state.run_task
         if current is not None and not current.done():
-            if not _active_node_is_paused(orchestrator):
+            if orchestrator.execution.snapshot()["phase"] != "paused":
                 raise HTTPException(status_code=409, detail="a harness run is already active")
             try:
                 await asyncio.wait_for(asyncio.shield(current), timeout=2.0)
             except TimeoutError:
-                raise HTTPException(status_code=409, detail="paused node is still settling; retry shortly") from None
+                raise HTTPException(status_code=409, detail="paused execution is still settling; retry shortly") from None
+        node_task = orchestrator.active_node_task()
+        if node_task is not None and not node_task.done():
+            if orchestrator.execution.snapshot()["phase"] != "paused":
+                raise HTTPException(status_code=409, detail="a harness run is already active")
+            try:
+                await asyncio.wait_for(asyncio.shield(node_task), timeout=2.0)
+            except TimeoutError:
+                raise HTTPException(status_code=409, detail="paused execution is still settling; retry shortly") from None
+        phase = orchestrator.execution.snapshot()["phase"]
+        if phase not in {"ready", "paused"}:
+            raise HTTPException(status_code=409, detail=f"execution is {phase}; it cannot accept a prompt")
         app.state.run_task = asyncio.create_task(_run_main_turn(orchestrator, text, realtime))
         setattr(orchestrator, "_server_run_task", app.state.run_task)
         realtime.publish("live_snapshot", {"snapshot": _live(orchestrator)})
         return {"accepted": True, "bootstrap": _bootstrap(orchestrator, workspace_path, dry_run, debug_enabled)}
 
-    @app.post("/api/interrupt")
-    async def interrupt(request: InterruptRequest) -> dict[str, Any]:
-        try:
-            result = await orchestrator.interrupt_current(request.reason, request.resumeMode)
-        except Exception as exc:
-            orchestrator.store.append_timeline({"type": "interrupt_error", "timestamp": now_iso_for_server(), "message": str(exc)})
-            result = {"target": "unknown", "error": str(exc), "state": orchestrator.get_state()}
+    @app.post("/api/execution/pause", status_code=202)
+    async def pause_execution(request: PauseRequest, response: Response) -> dict[str, Any]:
+        phase = orchestrator.execution.snapshot()["phase"]
+        if phase == "paused":
+            response.status_code = 200
+            return {"accepted": True, "execution": orchestrator.execution.snapshot()}
+        if phase == "pausing":
+            return {"accepted": True, "execution": orchestrator.execution.snapshot()}
+        if phase != "running":
+            raise HTTPException(status_code=409, detail=f"execution is {phase}")
+        task = app.state.pause_task
+        if task is None or task.done():
+            task = asyncio.create_task(_run_pause_execution(orchestrator, realtime, request.reason))
+            app.state.pause_task = task
+        await asyncio.sleep(0)
         realtime.publish("live_snapshot", {"snapshot": _live(orchestrator)})
-        return {"result": result, "bootstrap": _bootstrap(orchestrator, workspace_path, dry_run, debug_enabled)}
+        return {"accepted": True, "execution": orchestrator.execution.snapshot()}
+
+    @app.post("/api/execution/force-stop", status_code=202)
+    async def force_stop_execution(request: ForceStopRequest) -> dict[str, Any]:
+        if not request.confirm:
+            raise HTTPException(status_code=400, detail="confirm=true is required")
+        try:
+            result = await orchestrator.force_stop_current()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        realtime.publish("live_snapshot", {"snapshot": _live(orchestrator)})
+        return {"accepted": True, **result}
+
+    @app.post("/api/workflow/reset")
+    async def reset_workflow(request: WorkflowResetRequest) -> dict[str, Any]:
+        if not request.preserveAssets:
+            raise HTTPException(status_code=400, detail="This endpoint only supports preserveAssets=true.")
+        if _task_running(app.state.run_task) or orchestrator.is_active_node_task_running():
+            raise HTTPException(status_code=409, detail="cannot reset workflow while a harness task is active")
+        try:
+            state = await orchestrator.reset_workflow_preserving_assets()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        realtime.publish("live_snapshot", {"snapshot": _live(orchestrator)})
+        return {"ok": True, "state": state, "bootstrap": _bootstrap(orchestrator, workspace_path, dry_run, debug_enabled)}
 
     @app.post("/api/control/approve")
     async def approve_control() -> dict[str, Any]:
@@ -499,7 +607,7 @@ async def _run_main_turn(orchestrator: HarnessOrchestrator, text: str, realtime:
     try:
         await orchestrator.send_main_user_message(text)
     except RuntimeError as exc:
-        if "Interrupted by user" not in str(exc):
+        if "Paused by user" not in str(exc):
             orchestrator.store.append_timeline({"type": "error", "timestamp": now_iso_for_server(), "message": str(exc)})
             orchestrator.store.append_main_part(system_error_part_for_server(str(exc)))
     except Exception as exc:
@@ -507,6 +615,24 @@ async def _run_main_turn(orchestrator: HarnessOrchestrator, text: str, realtime:
         orchestrator.store.append_main_part(system_error_part_for_server(str(exc)))
     finally:
         setattr(orchestrator, "_server_run_task", None)
+        realtime.publish("live_snapshot", {"snapshot": _live(orchestrator)})
+
+
+async def _run_pause_execution(
+    orchestrator: HarnessOrchestrator,
+    realtime: RealtimeEventBroker,
+    reason: str,
+) -> None:
+    """Own pause-task completion so failures always reach SSE and are observed."""
+    try:
+        await orchestrator.interrupt_current(reason)
+    except Exception as exc:
+        orchestrator.store.append_timeline({
+            "type": "execution_pause_failed",
+            "timestamp": now_iso_for_server(),
+            "message": _format_exception(exc),
+        })
+    finally:
         realtime.publish("live_snapshot", {"snapshot": _live(orchestrator)})
 
 
@@ -602,15 +728,6 @@ async def _run_chain_summary_build(
 
 def _task_running(task: Any) -> bool:
     return task is not None and not task.done()
-
-
-def _active_node_is_paused(orchestrator: HarnessOrchestrator) -> bool:
-    state = orchestrator.get_state()
-    node_id = state.get("activeNodeSessionId")
-    if not node_id:
-        return False
-    node = orchestrator.store.read_node_session(node_id)
-    return bool(node and node.get("status") == "paused")
 
 
 def now_iso_for_server() -> str:

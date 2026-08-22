@@ -75,13 +75,11 @@ const state = {
     graphDepth: 2,
     graphAuthMode: 'manual',
     graphProtocol: '',
-    graphContext: '',
     graphModel: '',
     graphBaseUrl: '',
     graphApiKey: '',
     mainAuthMode: 'manual',
     mainProtocol: '',
-    mainContext: '',
     mainModel: '',
     mainBaseUrl: '',
     mainApiKey: '',
@@ -90,13 +88,11 @@ const state = {
     graphDepth: number;
     graphAuthMode: string;
     graphProtocol: string;
-    graphContext: string;
     graphModel: string;
     graphBaseUrl: string;
     graphApiKey: string;
     mainAuthMode: string;
     mainProtocol: string;
-    mainContext: string;
     mainModel: string;
     mainBaseUrl: string;
     mainApiKey: string;
@@ -113,7 +109,7 @@ const state = {
     predicate: (data: Bootstrap) => boolean;
     resolve: (data: Bootstrap) => void;
     reject: (error: Error) => void;
-    timer: number;
+    timer: number | null;
   }>,
 };
 
@@ -232,7 +228,7 @@ app.innerHTML = `
           <span>协议</span>
           <select id="graphProtocol">
             <option value="">自动</option>
-            <option value="anthropic">anthropic</option>
+            <option value="deepseek">deepseek</option>
             <option value="openai-compat">openai-compat</option>
           </select>
         </label>
@@ -378,6 +374,8 @@ app.innerHTML = `
     </section>
 
     <form id="sendForm" class="composer">
+      <p id="pauseWaitHint" class="pause-wait-hint" role="status" hidden></p>
+      <button id="forceStopBtn" type="button" class="danger ghost" hidden>强制停止</button>
       <div class="composer-shell">
         <textarea id="messageInput" rows="1" placeholder="向任务编排器发送消息"></textarea>
         <button id="interruptBtn" type="button" class="composer-stop-btn" title="暂停回答" hidden><span data-icon="Square"></span></button>
@@ -454,35 +452,6 @@ app.innerHTML = `
     </form>
   </dialog>
 
-  <dialog id="pauseDialog" class="pause-dialog">
-    <form method="dialog">
-      <header>
-        <div>
-          <div class="eyebrow"><span data-icon="Pause"></span><span>暂停当前执行</span></div>
-          <h3>请选择继续方式</h3>
-        </div>
-        <button value="cancel" class="icon-btn ghost" type="submit" title="取消"><span data-icon="X"></span></button>
-      </header>
-      <p class="pause-dialog-intro">暂停会先关闭当前模型进程，避免它在后台继续消耗 token。</p>
-      <div id="pauseOptions" class="pause-options">
-        <button type="button" class="pause-option" data-resume-mode="new_session">
-          <strong>重新启动新的 session</strong>
-          <span>不带入上一段模型对话，从当前工作区状态继续。</span>
-        </button>
-        <button type="button" class="pause-option" data-resume-mode="resume_keep">
-          <strong>复用上一个 session，保留当前消息</strong>
-          <span>保留被暂停的当前轮上下文，适合只是暂时停下的情况。</span>
-        </button>
-        <button type="button" class="pause-option pause-option-danger" data-resume-mode="resume_rollback">
-          <strong>复用上一个 session，回退当前消息</strong>
-          <span>移除工作区中当前未完成轮次的显示内容，并要求模型从回退前状态继续。</span>
-        </button>
-      </div>
-      <div class="pause-dialog-footer">
-        <button value="cancel" class="secondary-btn" type="submit">取消</button>
-      </div>
-    </form>
-  </dialog>
 `;
 
 const iconMap: Record<string, IconNode> = {
@@ -588,6 +557,8 @@ const els = {
   messageInput: query<HTMLTextAreaElement>('#messageInput'),
   sendBtn: query<HTMLButtonElement>('#sendBtn'),
   interruptBtn: query<HTMLButtonElement>('#interruptBtn'),
+  pauseWaitHint: query<HTMLElement>('#pauseWaitHint'),
+  forceStopBtn: query<HTMLButtonElement>('#forceStopBtn'),
   timeline: query('#timeline'),
   workspacePath: query('#workspacePath'),
   fileTree: query('#fileTree'),
@@ -610,8 +581,6 @@ const els = {
   resetChatBtn: query<HTMLButtonElement>('#resetChatBtn'),
   clearAllLogsBtn: query<HTMLButtonElement>('#clearAllLogsBtn'),
   dialog: query<HTMLDialogElement>('#detailDialog'),
-  pauseDialog: query<HTMLDialogElement>('#pauseDialog'),
-  pauseOptions: query<HTMLElement>('#pauseOptions'),
   dialogTitle: query('#dialogTitle'),
   dialogBody: query('#dialogBody'),
   deleteReferenceBtn: query<HTMLButtonElement>('#deleteReferenceBtn'),
@@ -788,10 +757,12 @@ async function saveKnowledgeGraphLlmConfig() {
   els.graphApiKeyInput.value = '';
 }
 els.interruptBtn.addEventListener('click', async () => {
-  const resumeMode = await chooseResumeMode();
-  if (!resumeMode) return;
   const reason = els.messageInput.value.trim();
-  await interruptCurrent(reason || 'User interrupted from web UI.', resumeMode);
+  await pauseCurrent(reason || 'User paused from web UI.');
+});
+els.forceStopBtn.addEventListener('click', async () => {
+  if (!confirm('强制停止可能使正在执行的工具结果变为未知。仅在正常暂停长时间无响应时使用。是否继续？')) return;
+  await postJson('/api/execution/force-stop', { confirm: true });
 });
 els.resetChatBtn.addEventListener('click', async () => {
   if (!confirm('这将重置聊天记录和 agent 工作流记忆，但保留 data/raw、references 和已构建的知识图谱。是否继续？')) return;
@@ -933,13 +904,17 @@ function applyRealtimeEvent(eventType: string, payload: JsonMap) {
   }
   if (!state.bootstrap) return;
   if (eventType === 'main_parts') {
-    state.bootstrap.mainParts = payload.mainParts || [];
+    state.bootstrap.mainParts = payload.mainPart
+      ? appendRealtimePart(state.bootstrap.mainParts, payload.mainPart)
+      : payload.mainParts || [];
     state.pendingParts = reconcilePendingParts(state.bootstrap);
     render();
     return;
   }
   if (eventType === 'knowledge_graph_parts') {
-    state.bootstrap.knowledgeGraphParts = payload.knowledgeGraphParts || [];
+    state.bootstrap.knowledgeGraphParts = payload.knowledgeGraphPart
+      ? appendRealtimePart(state.bootstrap.knowledgeGraphParts || [], payload.knowledgeGraphPart)
+      : payload.knowledgeGraphParts || [];
     render();
     return;
   }
@@ -951,7 +926,9 @@ function applyRealtimeEvent(eventType: string, payload: JsonMap) {
     return;
   }
   if (eventType === 'chain_summary_parts') {
-    state.bootstrap.chainSummaryParts = payload.chainSummaryParts || [];
+    state.bootstrap.chainSummaryParts = payload.chainSummaryPart
+      ? appendRealtimePart(state.bootstrap.chainSummaryParts || [], payload.chainSummaryPart)
+      : payload.chainSummaryParts || [];
     render();
     return;
   }
@@ -961,8 +938,13 @@ function applyRealtimeEvent(eventType: string, payload: JsonMap) {
     return;
   }
   if (eventType === 'node_parts') {
+    const nodePartById = payload.nodePartById || {};
+    const mergedNodeParts = { ...(state.bootstrap.nodePartsById || {}) };
+    for (const [nodeId, part] of Object.entries(nodePartById)) {
+      mergedNodeParts[nodeId] = appendRealtimePart(mergedNodeParts[nodeId] || [], part as JsonMap);
+    }
     state.bootstrap.nodePartsById = {
-      ...(state.bootstrap.nodePartsById || {}),
+      ...mergedNodeParts,
       ...(payload.nodePartsById || {}),
     };
     if (payload.nodes) state.bootstrap.nodes = payload.nodes;
@@ -983,6 +965,16 @@ function applyRealtimeEvent(eventType: string, payload: JsonMap) {
     const merged = { ...state.bootstrap, ...payload.snapshot } as Bootstrap;
     applyBootstrapSnapshot(merged);
   }
+}
+
+function appendRealtimePart(parts: JsonMap[], part: JsonMap): JsonMap[] {
+  if (!part || typeof part !== 'object') return parts;
+  const id = String(part.id || '');
+  const existingIndex = id ? parts.findIndex((item) => String(item?.id || '') === id) : -1;
+  if (existingIndex < 0) return [...parts, part];
+  const next = [...parts];
+  next[existingIndex] = part;
+  return next;
 }
 
 function applyBootstrapSnapshot(data: Bootstrap) {
@@ -1028,7 +1020,28 @@ function render() {
 
   const ws = data.state || {};
   const activeNode = ws.activeNode;
-  setHtmlIfChanged(els.statusText, statusPill(activeNode ? `执行中：${nodeDisplayName(activeNode)}` : '就绪', activeNode ? 'active' : 'ready'));
+  const activeSession = getActiveNodeSession(data);
+  const executionPhase = String(data.execution?.phase || 'ready');
+  const pauseWaiting = executionPhase === 'pausing';
+  const activeLabel = pauseWaiting
+    ? `正在安全暂停：${nodeDisplayName(activeNode) || '主会话'}`
+    : activeSession?.status === 'paused'
+    ? `已暂停：${nodeDisplayName(activeNode)}`
+    : activeNode && !data.runtime?.running
+      ? `等待恢复：${nodeDisplayName(activeNode)}`
+      : activeNode
+        ? `执行中：${nodeDisplayName(activeNode)}`
+        : '就绪';
+  const activeTone = pauseWaiting
+    ? 'pending'
+    : activeSession?.status === 'paused' || (activeNode && !data.runtime?.running)
+    ? 'ready'
+    : activeNode ? 'active' : 'ready';
+  setHtmlIfChanged(els.statusText, statusPill(activeLabel, activeTone));
+  els.pauseWaitHint.hidden = !pauseWaiting;
+  els.pauseWaitHint.textContent = pauseWaiting
+    ? '正在等待 DSH 取消当前 turn、收拢子 agent 并完成持久化 checkpoint。'
+    : '';
   els.modeText.textContent = data.dryRun ? `${modeLabel(ws.controlMode || ws.mode)} / 试运行` : modeLabel(ws.controlMode || ws.mode || '-');
   setHtmlIfChanged(els.variantText, variantPill(data.variant));
   els.modelText.textContent = data.llmConfig?.config?.model || 'sdk-default';
@@ -1198,7 +1211,7 @@ function renderNodeDetail(specs: JsonMap[], nodes: JsonMap[]) {
   for (const item of els.nodeDetail.querySelectorAll<HTMLElement>('.session-item')) {
     item.addEventListener('click', async () => {
       const log = await fetchJson(`/api/nodes/${item.dataset.session}/log`);
-      showDetail(`节点日志 ${item.dataset.session}`, log);
+      showDetail(`节点日志 ${item.dataset.session}`, displaySafeSessionParts(log));
     });
   }
   for (const item of els.nodeDetail.querySelectorAll<HTMLElement>('.artifact-item')) {
@@ -1368,7 +1381,6 @@ function syncSettingsFromBootstrap(data: Bootstrap) {
   const main = data.llmConfig?.config || {};
   state.settings.mainAuthMode = main.authMode || 'manual';
   state.settings.mainProtocol = main.protocol || '';
-  state.settings.mainContext = main.contextWindow || '';
   state.settings.mainModel = main.model || '';
   state.settings.mainBaseUrl = main.baseUrl || '';
   // apiKey is masked (e.g. "****1234"); never seed the editor with a real value
@@ -1376,7 +1388,6 @@ function syncSettingsFromBootstrap(data: Bootstrap) {
   const graph = data.knowledgeGraphLlmConfig?.config || {};
   state.settings.graphAuthMode = graph.authMode || 'manual';
   state.settings.graphProtocol = graph.protocol || '';
-  state.settings.graphContext = graph.contextWindow || '';
   state.settings.graphModel = graph.model || '';
   state.settings.graphBaseUrl = graph.baseUrl || '';
 
@@ -1467,7 +1478,6 @@ function renderLlmSection(prefix: 'graph' | 'main', title: string, description: 
   const s = state.settings;
   const authValue = (isMain ? s.mainAuthMode : s.graphAuthMode) || 'manual';
   const protocolValue = isMain ? s.mainProtocol : s.graphProtocol;
-  const contextValue = isMain ? s.mainContext : s.graphContext;
   const modelValue = isMain ? s.mainModel : s.graphModel;
   const baseUrlValue = isMain ? s.mainBaseUrl : s.graphBaseUrl;
   const authOptions = [
@@ -1476,16 +1486,11 @@ function renderLlmSection(prefix: 'graph' | 'main', title: string, description: 
   ];
   const protocolOptions = [
     { value: '', label: '自动' },
-    { value: 'anthropic', label: 'anthropic' },
+    { value: 'deepseek', label: 'deepseek' },
     { value: 'openai-compat', label: 'openai-compat' },
   ];
-  const contextOptions = [
-    { value: '', label: '默认' },
-    { value: '200k', label: '200k' },
-    { value: '1m', label: '1m' },
-  ];
   const modelPlaceholder = isMain ? '例如 deepseek-v4-pro' : '默认继承主模型';
-  const baseUrlPlaceholder = isMain ? 'https://api.example.com/anthropic' : '默认继承主接口地址';
+  const baseUrlPlaceholder = isMain ? 'https://api.deepseek.com' : '默认继承主接口地址';
   const apiKeyPlaceholder = '留空表示保持当前密钥';
   const saveBtnId = isMain ? 'saveMainLlmBtn' : 'saveGraphLlmBtn2';
   const resetBtnId = isMain ? 'resetMainLlmBtn' : '';
@@ -1503,10 +1508,6 @@ function renderLlmSection(prefix: 'graph' | 'main', title: string, description: 
         <div class="settings-row">
           <div class="settings-row-label">接口协议</div>
           <div class="settings-row-control">${segmentedHtml(`${prefix}Protocol`, protocolOptions.map((o) => o.value), protocolValue, (v) => v, protocolOptions.map((o) => o.label))}</div>
-        </div>
-        <div class="settings-row">
-          <div class="settings-row-label">上下文窗口</div>
-          <div class="settings-row-control">${segmentedHtml(`${prefix}Context`, contextOptions.map((o) => o.value), contextValue, (v) => v, contextOptions.map((o) => o.label))}</div>
         </div>
         <div class="settings-row">
           <div class="settings-row-label">模型</div>
@@ -1560,10 +1561,8 @@ function bindSettingsHandlers() {
           saveRuntimeSettings();
         } else if (name === 'graphAuthMode') state.settings.graphAuthMode = value;
         else if (name === 'graphProtocol') state.settings.graphProtocol = value;
-        else if (name === 'graphContext') state.settings.graphContext = value;
         else if (name === 'mainAuthMode') state.settings.mainAuthMode = value;
         else if (name === 'mainProtocol') state.settings.mainProtocol = value;
-        else if (name === 'mainContext') state.settings.mainContext = value;
       });
     }
   }
@@ -1632,7 +1631,6 @@ async function saveLlmConfig(isMain: boolean) {
         model: s.mainModel,
         apiKey: s.mainApiKey || undefined,
         baseUrl: s.mainBaseUrl,
-        contextWindow: s.mainContext,
       }
     : {
         authMode: s.graphAuthMode,
@@ -1640,7 +1638,6 @@ async function saveLlmConfig(isMain: boolean) {
         model: s.graphModel,
         apiKey: s.graphApiKey || undefined,
         baseUrl: s.graphBaseUrl,
-        contextWindow: s.graphContext,
       };
   try {
     const url = isMain ? '/api/llm-config' : '/api/knowledge-graph/llm-config';
@@ -1671,14 +1668,13 @@ async function saveLlmConfig(isMain: boolean) {
 }
 
 async function resetMainLlmConfig() {
-  if (!confirm('是否将主模型恢复为文件默认值？这会清空保存在 <workspace>/config.llm.json 中的模型、接口地址、协议和上下文窗口设置；API 密钥会保留。')) return;
+  if (!confirm('是否将主模型恢复为文件默认值？这会清空保存在 <workspace>/config.llm.json 中的模型、接口地址和协议设置；API 密钥会保留。')) return;
   try {
     const result = await postJson('/api/llm-config', {
       authMode: 'sdk-default',
       protocol: '',
       model: '',
       baseUrl: '',
-      contextWindow: '',
     });
     syncSettingsFromBootstrap(result.bootstrap);
     applyBootstrapSnapshot(result.bootstrap);
@@ -2632,13 +2628,14 @@ function messageHtml(part: JsonMap) {
     const summary = toolSummary(part);
     const detail = toolDetail(part);
     const toolName = toolNameForPart(part);
-    const done = part.type === 'tool_result' || part.status === 'completed';
+    const failed = part.status === 'failed';
+    const done = !failed && (part.type === 'tool_result' || part.status === 'completed');
     const partId = String(part.id || `${part.timestamp || ''}:${toolName}:${part.type || ''}`);
     const expanded = state.expandedToolPartIds.has(partId);
     return `
       <article class="message ${escapeHtml(roleClass)} tool-collapsed${expanded ? ' expanded' : ''}" data-part-id="${escapeHtml(partId)}">
         <button class="tool-card${expanded ? ' expanded' : ''}" type="button" data-tool-toggle>
-          <span class="tool-status ${done ? 'done' : 'running'}"><span data-icon="${done ? 'Check' : 'TerminalSquare'}"></span></span>
+          <span class="tool-status ${failed ? 'failed' : done ? 'done' : 'running'}"><span data-icon="${failed ? 'CircleX' : done ? 'Check' : 'TerminalSquare'}"></span></span>
           <span class="tool-copy">
             <span class="tool-title">${escapeHtml(summary)}</span>
             <span class="tool-meta">${escapeHtml(source)}${escapeHtml(toolName)} · ${escapeHtml(partTypeLabel(part.type || 'tool'))} · ${formatTime(part.timestamp)}</span>
@@ -2760,33 +2757,71 @@ function normalizePendingText(text: string): string {
 }
 
 function normalizeChatParts(parts: JsonMap[]): JsonMap[] {
-  const SUPPRESS_SYSTEM_SUBTYPES = new Set([
-    'init',
-    'task_started',
-    'task_progress',
-    'task_updated',
-    'task_notification',
-    'task_completed',
-    'task_failed',
-    'task_stopped',
-    'task_output',
-    'system',
-    'thinking_tokens',
-  ]);
   return parts
-    .map((part: JsonMap) => ({ ...part, displayText: displayTextForPart(part) }))
-    .filter((part: JsonMap) => {
-      if (part.type === 'loading') return true;
-      if (isReasoningOnlyPart(part)) return false;
-      if (!part.displayText.trim()) return false;
-      if (part.role === 'system' && part.type === 'raw') {
-        const subtype = part.raw?.subtype || part.text || part.displayText || '';
-        const normalizedSubtype = subtype.trim();
-        if (SUPPRESS_SYSTEM_SUBTYPES.has(normalizedSubtype) || normalizedSubtype.endsWith('_tokens')) return false;
+    .map((part: JsonMap): JsonMap | null => {
+      const failureText = protocolFailureText(part);
+      if (failureText) {
+        return {
+          ...part,
+          role: 'system',
+          type: 'text',
+          text: failureText,
+          displayText: failureText,
+        };
       }
-      if (part.role === 'system' && part.type === 'result' && part.raw?.is_error !== true) return false;
-      return true;
-    });
+      if (!isDisplayableSessionPart(part) || isReasoningOnlyPart(part)) return null;
+      const displayText = displayTextForPart(part);
+      return displayText.trim() ? { ...part, displayText } : null;
+    })
+    .filter((part: JsonMap | null): part is JsonMap => part !== null);
+}
+
+function isDisplayableSessionPart(part: JsonMap): boolean {
+  if (part.type === 'loading') return true;
+  // Semantic tool cards carry a concise intend, parameters, status, and
+  // result. Raw JSON-RPC events remain implementation/audit data and are
+  // hidden below.
+  if (part.type === 'tool_call' || part.type === 'tool_result') return true;
+  if (part.type === 'tool_use') return false;
+  if (part.role === 'system' && part.type === 'raw') return false;
+  // A successful SDK result is a transport marker rather than user-facing
+  // content.  Failures are converted to a readable system message above.
+  if (part.role === 'system' && part.type === 'result') return part.raw?.is_error === true;
+  return true;
+}
+
+function protocolFailureText(part: JsonMap): string {
+  const dshError = dshToolResultFailureText(part.raw);
+  if (dshError) return `工具执行失败：${dshError}`;
+  const toolPart = part.type === 'tool_use' || part.type === 'tool_result';
+  const failed = part.status === 'failed' || part.raw?.is_error === true || part.raw?.isError === true;
+  if (!toolPart || !failed) return '';
+  const detail = String(part.resultText || toolResultTextFromRaw(part.raw) || part.text || '').trim();
+  return detail ? `工具执行失败：${detail}` : '工具执行失败。';
+}
+
+function dshToolResultFailureText(raw: any): string {
+  if (raw?.type !== 'tool/result') return '';
+  const content = raw?.data?.message?.content;
+  if (!Array.isArray(content)) return '';
+  const failure = content.find((item: JsonMap) => item?.type === 'tool-result' && item.isError === true);
+  if (!failure) return '';
+  return dshContentText(failure.content) || '未提供错误详情。';
+}
+
+function dshContentText(content: any): string {
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((item: any) => typeof item === 'string' ? item : typeof item?.text === 'string' ? item.text : '')
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+function displaySafeSessionParts(parts: unknown): JsonMap[] {
+  if (!Array.isArray(parts)) return [];
+  return normalizeChatParts(parts as JsonMap[]).map(({ raw, resultRaw, ...part }) => part);
 }
 
 function isReasoningOnlyPart(part: JsonMap): boolean {
@@ -2933,14 +2968,17 @@ function updateControls(data: Bootstrap) {
   const activeSession = getActiveNodeSession(data);
   const activePaused = Boolean(ws.activeNode && activeSession?.status === 'paused');
   const activeRunning = Boolean(ws.activeNode && activeSession?.status === 'running');
+  const executionPhase = String(data.execution?.phase || 'ready');
+  const pauseWaiting = executionPhase === 'pausing';
   const pendingControl = Boolean(ws.pendingControl);
   els.sendBtn.disabled = state.busy || (Boolean(ws.activeNode) && !activePaused);
   els.messageInput.disabled = state.busy || (Boolean(ws.activeNode) && !activePaused);
   els.messageInput.placeholder = activePaused
     ? '补充说明后点击 Resume，当前 node 会继续执行'
     : '向任务编排器发送消息';
-  els.interruptBtn.disabled = !state.busy && !activeRunning;
+  els.interruptBtn.disabled = pauseWaiting || (!state.busy && !activeRunning);
   els.interruptBtn.hidden = !state.busy && !activeRunning;
+  els.forceStopBtn.hidden = executionPhase !== 'pausing';
   els.uploadBtn.disabled = state.busy;
   els.rawZipUploadBtn.disabled = state.busy;
   els.approveControlBtn.disabled = state.busy || !pendingControl;
@@ -3206,45 +3244,15 @@ function nextPaint() {
   return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 }
 
-type ResumeMode = 'new_session' | 'resume_keep' | 'resume_rollback';
-
-function chooseResumeMode(): Promise<ResumeMode | null> {
-  return new Promise((resolve) => {
-    let selected: ResumeMode | null = null;
-    const finish = (mode: ResumeMode | null) => {
-      selected = mode;
-      els.pauseDialog.close();
-    };
-    const onClose = () => {
-      els.pauseDialog.removeEventListener('close', onClose);
-      resolve(selected);
-    };
-    els.pauseDialog.addEventListener('close', onClose, { once: true });
-    for (const option of els.pauseOptions.querySelectorAll<HTMLButtonElement>('[data-resume-mode]')) {
-      option.onclick = () => {
-        const mode = option.dataset.resumeMode;
-        if (mode === 'new_session' || mode === 'resume_keep' || mode === 'resume_rollback') finish(mode);
-      };
-    }
-    els.pauseDialog.showModal();
-  });
-}
-
-async function interruptCurrent(reason: string, resumeMode: ResumeMode) {
+async function pauseCurrent(reason: string) {
   els.interruptBtn.disabled = true;
   try {
-    const result = await postJson('/api/interrupt', { reason, resumeMode });
-    applyBootstrapSnapshot(result.bootstrap);
-    if (state.busy) {
-      state.loadingMessage = loadingPart('暂停中，等待当前请求收尾');
-      render();
-      try {
-        await waitForBackendIdle(5000);
-      } catch {
-        // The backend may need longer to let the interrupted SDK task
-        // unwind. Pause has already been recorded, so do not leave a
-        // permanent loading row or show this settling delay as an error.
-      }
+    await postJson('/api/execution/pause', { reason });
+    state.loadingMessage = loadingPart('正在安全暂停并写入 DSH checkpoint');
+    render();
+    const settled = await waitForRealtimeState((data) => ['paused', 'failed'].includes(data.execution?.phase || ''));
+    if (settled.execution?.phase === 'failed') {
+      throw new Error(settled.execution.lastError || 'DSH pause failed.');
     }
     state.loadingMessage = null;
     state.pendingParts = reconcilePendingParts(state.bootstrap);
@@ -3280,7 +3288,7 @@ async function postSend(text: string): Promise<any> {
 }
 
 function isPausedResumeSettling(message: string): boolean {
-  if (!isActiveNodePaused(state.bootstrap)) return false;
+  if (state.bootstrap?.execution?.phase !== 'paused') return false;
   return message.includes('still settling') || message.includes('already active');
 }
 
@@ -3288,17 +3296,17 @@ async function waitForBackendIdle(timeoutMs: number) {
   await waitForRealtimeState((data) => !data.runtime?.running, timeoutMs);
 }
 
-function waitForRealtimeState(predicate: (data: Bootstrap) => boolean, timeoutMs: number) {
+function waitForRealtimeState(predicate: (data: Bootstrap) => boolean, timeoutMs?: number) {
   if (state.bootstrap && predicate(state.bootstrap)) return Promise.resolve(state.bootstrap);
   return new Promise<Bootstrap>((resolve, reject) => {
     const waiter = {
       predicate,
       resolve,
       reject,
-      timer: window.setTimeout(() => {
-        state.realtimeWaiters = state.realtimeWaiters.filter((candidate) => candidate !== waiter);
-        reject(new Error('Timed out waiting for a realtime state update.'));
-      }, timeoutMs),
+      timer: timeoutMs === undefined ? null : window.setTimeout(() => {
+          state.realtimeWaiters = state.realtimeWaiters.filter((candidate) => candidate !== waiter);
+          reject(new Error('Timed out waiting for a realtime state update.'));
+        }, timeoutMs),
     };
     state.realtimeWaiters.push(waiter);
   });
@@ -3307,7 +3315,7 @@ function waitForRealtimeState(predicate: (data: Bootstrap) => boolean, timeoutMs
 function resolveRealtimeWaiters(data: Bootstrap) {
   for (const waiter of [...state.realtimeWaiters]) {
     if (!waiter.predicate(data)) continue;
-    window.clearTimeout(waiter.timer);
+    if (waiter.timer !== null) window.clearTimeout(waiter.timer);
     state.realtimeWaiters = state.realtimeWaiters.filter((candidate) => candidate !== waiter);
     waiter.resolve(data);
   }

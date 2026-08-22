@@ -12,7 +12,7 @@ BUILDER_SYSTEM_PROMPT_BASE = """你是 HarnessingTS 的 Agent 1：Literature Kno
 
 处理流程：
 1. 先调用 scan_references，优先处理 new_or_changed references。未变化 reference 可只使用 brief，不要重读全文。
-2. 对每个新/变更 PDF reference，先调用 extract_reference_text 获取确定性页级文本；quoted_fragments 必须优先来自该工具返回的文本。只有 extract_reference_text 明确失败或无文本时，才使用 SDK Read 做视觉检查；不要用 Grep 搜索 PDF 二进制文件来判断文本层是否存在。
+2. 对每个新/变更 PDF reference，先调用 extract_reference_text 获取确定性页级文本；quoted_fragments 必须优先来自该工具返回的文本。只有 extract_reference_text 明确失败或无文本时，才使用 DSH `bash` 做视觉检查；不要用 shell 搜索 PDF 二进制文件来判断文本层是否存在。
 3. 读取 user/problem-contract.md、user/data-spec.md、artifacts/reference-knowledge.md（如果存在）。
 4. 对每个新/变更 reference，提取 Evidence，并调用 add_evidence。
 5. 基于 Evidence 提取 Knowledge，并调用 add_knowledge。Knowledge 应包含 compact summary，便于后续复用上下文。

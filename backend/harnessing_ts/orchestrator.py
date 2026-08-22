@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import hmac
+import json
+import secrets
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
 from harnessing_ts.agent.sdk_runner import SdkRunner
 from harnessing_ts.agent.session_factory import build_main_runner, build_node_runner
-from harnessing_ts.agent.translate import system_text_part, user_text_part
+from harnessing_ts.agent.translate import public_display_part, system_text_part, user_text_part
 from harnessing_ts.chain_summary import build_chain_summary
+from harnessing_ts.execution import ExecutionController
 from harnessing_ts.knowledge_graph import (
     answer_extractor_source_query,
     answer_knowledge_query,
@@ -29,18 +34,15 @@ from harnessing_ts.reference_feature_extractor import (
 from harnessing_ts.prompts.compose import PromptContext, build_main_attachment
 from harnessing_ts.schema import (
     NODE_SPECS,
-    RESUME_MODES,
     ControlRequest,
     NodeSession,
     NodeType,
     Part,
-    ResumeMode,
     RunRecord,
     WorkspaceState,
 )
 from harnessing_ts.settings.llm import LlmConfig, mask_llm_config, read_effective_llm_config
 from harnessing_ts.state.jsonl import clear_file
-from harnessing_ts.state.message_log import MessageLog
 from harnessing_ts.state.workspace_store import WorkspaceStore, now_iso
 from harnessing_ts.tools.compose_tools import build_node_native_tools
 from harnessing_ts.variants import resolve_variant
@@ -83,6 +85,7 @@ class HarnessOrchestrator:
         self.dry_run = dry_run
         self.variant = resolve_variant()
         self.store = WorkspaceStore(workspace_path)
+        self.execution = ExecutionController(self.store)
         self.node_state = NodeStateMachine(workspace_path, self.variant)
         self.state: WorkspaceState | None = None
         self.main_runner: SdkRunner | None = None
@@ -90,8 +93,16 @@ class HarnessOrchestrator:
         self._main_runner_reference_feature_ready: bool | None = None
         self.active_node_runner: SdkRunner | None = None
         self.active_node_session: NodeSession | None = None
+        self._active_node_task: asyncio.Task[None] | None = None
         self._realtime_event_sink: Callable[[str, dict[str, Any]], None] | None = None
-        self._realtime_parts_cache: dict[str, list[Part]] = {}
+        self._runtime_snapshot_provider: Callable[[], dict[str, Any]] | None = None
+        # The same semantic tool card is emitted once when it starts and
+        # again after its result has been merged into that card.  Cache the
+        # public payload, not only its id, so the latter update reaches SSE.
+        self._realtime_parts_cache: dict[str, str] = {}
+        self._mcp_control_url: str | None = None
+        self._mcp_capabilities: dict[str, dict[str, Any]] = {}
+        self._mcp_calls: dict[str, dict[str, str]] = {}
 
     def initialize(self, reporter: Callable[[str], None] | None = None) -> WorkspaceState:
         self.state = self.store.initialize(self.mode, reporter=reporter)
@@ -101,19 +112,256 @@ class HarnessOrchestrator:
     def set_realtime_event_sink(self, sink: Callable[[str, dict[str, Any]], None] | None) -> None:
         self._realtime_event_sink = sink
 
+    def set_runtime_snapshot_provider(self, provider: Callable[[], dict[str, Any]] | None) -> None:
+        self._runtime_snapshot_provider = provider
+
+    def is_active_node_task_running(self) -> bool:
+        task = self._active_node_task
+        return task is not None and not task.done()
+
+    def active_node_task(self) -> asyncio.Task[None] | None:
+        return self._active_node_task
+
+    def _emit_runtime_snapshot(self) -> None:
+        if self._runtime_snapshot_provider:
+            self._emit_realtime("live_snapshot", {"snapshot": self._runtime_snapshot_provider()})
+
+    def recover_interrupted_execution(self) -> bool:
+        """Fence a turn abandoned by a dead server; DSH repairs it on resume."""
+        self._ensure_initialized()
+        assert self.state
+        changed = self.execution.recover_interrupted()
+        node_id = self.state.get("activeNodeSessionId")
+        node = self.store.read_node_session(node_id) if node_id else None
+        if self.store.read_execution() is None and node and node.get("status") == "running":
+            raise RuntimeError(
+                "Legacy runtime workspace has a running node but no state/execution.json; "
+                "start a new runtime workspace instead of guessing its pause boundary."
+            )
+        if changed and node and node.get("status") == "running":
+            node.update({"status": "paused", "pausedAt": now_iso(), "summary": "Paused after server restart; DSH will repair and resume the same session."})
+            self.store.write_node_session(node)
+            self.active_node_session = node
+        return changed
+
+    async def complete_interrupted_recovery(self) -> None:
+        snapshot = self.execution.snapshot()
+        if snapshot["phase"] != "recovering":
+            return
+        actor_id = str(snapshot.get("actorId") or "")
+        try:
+            if actor_id == "main":
+                self._ensure_main_runner()
+                runner = self.main_runner
+            elif actor_id.startswith("node:"):
+                node_id = actor_id.split(":", 1)[1]
+                node = self.store.read_node_session(node_id)
+                if not node:
+                    raise RuntimeError(f"Cannot recover missing node actor {actor_id}")
+                self.active_node_session = node
+                self._spawn_node_runner(node)
+                runner = self.active_node_runner
+            else:
+                raise RuntimeError(f"Unknown recovery actor {actor_id}")
+            if runner is None:
+                raise RuntimeError(f"No runner available for recovery actor {actor_id}")
+            session_id = snapshot.get("sessionId")
+            if not isinstance(session_id, str) or not session_id:
+                raise RuntimeError(f"Recovery actor {actor_id} has no durable session identity")
+            runner.adopt_recovery_session(session_id)
+            await runner.recover()
+            await self.execution.recovery_finished(checkpoint_seq=runner.checkpoint_seq)
+        except Exception as exc:
+            await self.execution.fail(exc)
+        self._emit_runtime_snapshot()
+
+    def configure_mcp_control(self, control_url: str) -> None:
+        """Route DSH stdio MCP calls back to this live orchestrator instance.
+
+        The MCP server lives in a DSH-owned child process.  Giving it a scoped,
+        unguessable capability avoids reconstructing another orchestrator (and
+        therefore losing this process's state and realtime event sink).  The
+        bridge values use DSH_MCP_* names so DSH's subprocess seam scrubs them
+        from model-executed shell commands; Cordis forwards them explicitly to
+        the MCP process only.
+        """
+        self._mcp_control_url = control_url.rstrip("/")
+
+    def _issue_mcp_capability(
+        self,
+        *,
+        role: str,
+        allowed_tools: list[str],
+        node_session_id: str | None = None,
+    ) -> dict[str, str]:
+        if not self._mcp_control_url:
+            return {}
+        token = secrets.token_urlsafe(32)
+        self._mcp_capabilities[token] = {
+            "workspace": str(self.workspace_path.resolve()),
+            "role": role,
+            "nodeSessionId": node_session_id or "",
+            "allowedTools": frozenset(allowed_tools),
+            "epoch": self.execution.snapshot().get("epoch"),
+            "leaseId": self.execution.snapshot().get("leaseId"),
+        }
+        return {
+            "DSH_MCP_CONTROL_URL": self._mcp_control_url,
+            "DSH_MCP_CAPABILITY": token,
+        }
+
+    def _rotate_runner_mcp_capability(self, runner: SdkRunner) -> None:
+        self._revoke_runner_mcp_capability(runner)
+        bridge_env = self._issue_mcp_capability(
+            role=runner.config.session_role,
+            allowed_tools=runner.config.allowed_tools,
+            node_session_id=runner.config.node_session_id,
+        )
+        runner.config.env = {**(runner.config.env or {}), **bridge_env}
+
+    def _revoke_runner_mcp_capability(self, runner: SdkRunner) -> None:
+        config = getattr(runner, "config", None)
+        token = (getattr(config, "env", None) or {}).get("DSH_MCP_CAPABILITY")
+        if token:
+            self._mcp_capabilities.pop(token, None)
+
+    def _mcp_call_is_current(self, capability: str, node_session_id: str | None = None) -> bool:
+        """Return whether an MCP call still belongs to its leased runner.
+
+        A capability is revoked as soon as its runner is closed.  Checking it
+        again after an awaited operation prevents an old MCP request from
+        publishing a late result into a paused node or a newer runner for the
+        same node session.
+        """
+        record = self._mcp_capabilities.get(capability)
+        if not record or record.get("nodeSessionId") != (node_session_id or ""):
+            return False
+        execution = self.execution.snapshot()
+        leased = bool(
+            execution.get("phase") == "running"
+            and record.get("epoch") == execution.get("epoch")
+            and record.get("leaseId") == execution.get("leaseId")
+        )
+        if not leased or not node_session_id:
+            return leased
+        state = self.store.read_state() or self.state
+        node = self.store.read_node_session(node_session_id)
+        return bool(
+            state
+            and state.get("activeNodeSessionId") == node_session_id
+            and node
+            and node.get("status") == "running"
+        )
+
+    def _require_current_mcp_call(self, capability: str, node_session_id: str | None = None) -> None:
+        if not self._mcp_call_is_current(capability, node_session_id):
+            raise RuntimeError("This MCP call was cancelled because its runner lease is no longer active.")
+
+    def _require_current_node_mcp_call(self, node_session_id: str, capability: str) -> None:
+        if not self._mcp_call_is_current(capability, node_session_id):
+            raise RuntimeError(
+                "This node MCP call was cancelled because its runner is no longer active."
+            )
+
+    @staticmethod
+    def _mcp_call_key(node_session_id: str | None) -> str:
+        return f"node:{node_session_id}" if node_session_id else "main"
+
+    def _active_mcp_tools(self, node_session_id: str | None) -> list[str]:
+        calls = self._mcp_calls.get(self._mcp_call_key(node_session_id), {})
+        return sorted(set(calls.values()))
+
+    def _begin_mcp_call(self, node_session_id: str | None, tool: str) -> str:
+        call_id = secrets.token_urlsafe(12)
+        self._mcp_calls.setdefault(self._mcp_call_key(node_session_id), {})[call_id] = tool
+        return call_id
+
+    def _end_mcp_call(self, node_session_id: str | None, call_id: str) -> None:
+        key = self._mcp_call_key(node_session_id)
+        calls = self._mcp_calls.get(key)
+        if not calls:
+            return
+        calls.pop(call_id, None)
+        if not calls:
+            self._mcp_calls.pop(key, None)
+
+    async def dispatch_dsh_mcp_call(
+        self,
+        *,
+        capability: str,
+        workspace: str,
+        role: str,
+        node_session_id: str | None,
+        tool: str,
+        args: dict[str, Any],
+    ) -> Any:
+        """Execute a bridged MCP call on the live state owner.
+
+        This is intentionally not a public API: ``server.py`` binds it to
+        loopback only and validates the per-runner capability before dispatch.
+        """
+        record = self._mcp_capabilities.get(capability)
+        if not record or not hmac.compare_digest(str(record["workspace"]), str(Path(workspace).resolve())):
+            raise PermissionError("Invalid DeepSeek Harness MCP capability.")
+        if record["role"] != role or record["nodeSessionId"] != (node_session_id or ""):
+            raise PermissionError("DeepSeek Harness MCP capability is bound to a different session.")
+        execution = self.execution.snapshot()
+        if (
+            execution.get("phase") != "running"
+            or record.get("epoch") != execution.get("epoch")
+            or record.get("leaseId") != execution.get("leaseId")
+        ):
+            raise PermissionError("DeepSeek Harness MCP capability lease is no longer active.")
+        qualified_tool = f"mcp__ts_harness__{tool}"
+        if qualified_tool not in record["allowedTools"]:
+            raise PermissionError(f"DeepSeek Harness MCP tool is not allowed: {tool}")
+        if node_session_id:
+            self._require_current_node_mcp_call(node_session_id, capability)
+
+        call_id = self._begin_mcp_call(node_session_id, tool)
+        try:
+            if tool == "enter_node":
+                return await self.request_enter_node(args)
+            if tool == "query_knowledge":
+                return await self.request_query_knowledge(
+                    args,
+                    node_session_id=node_session_id,
+                    capability=capability,
+                )
+            if tool == "extract_reference_features":
+                return self.request_extract_reference_features(args)
+            if tool == "inspect_reference_feature_extractor":
+                return self.request_inspect_reference_feature_extractor(args)
+            if tool == "validate_reference_feature_extractor":
+                return await self.request_validate_reference_feature_extractor(args)
+            if tool == "finish_node":
+                if not node_session_id:
+                    raise PermissionError("finish_node requires a node-bound MCP capability.")
+                return await self.request_finish_node_for_node(args, node_session_id)
+            if tool in {"record_artifact", "record_run"}:
+                if not node_session_id:
+                    raise PermissionError(f"{tool} requires a node-bound MCP capability.")
+                node = self.store.read_node_session(node_session_id)
+                if not node:
+                    raise RuntimeError("Unknown active node session.")
+                if tool == "record_artifact":
+                    return self.record_artifact_for_node(args, node_session_id, node["nodeType"])
+                return self.record_run_for_node(args, node_session_id, node["nodeType"])
+            if tool == "get_runtime_settings":
+                return self.get_runtime_settings()
+            raise RuntimeError(f"Unknown DeepSeek Harness MCP tool: {tool}")
+        finally:
+            self._end_mcp_call(node_session_id, call_id)
+
     def _emit_realtime(self, event_type: str, payload: dict[str, Any]) -> None:
         if self._realtime_event_sink:
             self._realtime_event_sink(event_type, payload)
 
     def _emit_main_parts(self, _part: Part) -> None:
-        self._emit_parts_if_changed("main_parts", "mainParts", self.get_main_parts())
+        self._emit_part_if_changed("main_parts", "mainPart", public_display_part(_part))
 
     def _emit_knowledge_graph_parts(self, _part: Part) -> None:
-        self._emit_parts_if_changed(
-            "knowledge_graph_parts",
-            "knowledgeGraphParts",
-            self.get_knowledge_graph_parts(),
-        )
+        self._emit_part_if_changed("knowledge_graph_parts", "knowledgeGraphPart", public_display_part(_part))
 
     def _emit_knowledge_graph_snapshot(self) -> None:
         self._emit_realtime("knowledge_graph_snapshot", {
@@ -123,35 +371,37 @@ class HarnessOrchestrator:
         })
 
     def _emit_node_parts(self, node_id: str, _part: Part) -> None:
-        parts = self.get_node_parts(node_id)
-        cache_key = f"node_parts:{node_id}"
-        if self._realtime_parts_cache.get(cache_key) == parts:
+        part = public_display_part(_part)
+        cache_key = f"node_parts:{node_id}:{part.get('id')}"
+        if not self._part_changed(cache_key, part):
             return
-        self._realtime_parts_cache[cache_key] = parts
         self._emit_realtime("node_parts", {
-            "nodePartsById": {node_id: parts},
+            "nodePartById": {node_id: part},
             "nodes": self.get_node_sessions(),
             "state": self.get_state(),
             "timeline": self.get_timeline(),
         })
 
     def _emit_chain_summary_parts(self, _part: Part) -> None:
-        self._emit_parts_if_changed(
-            "chain_summary_parts",
-            "chainSummaryParts",
-            self.get_chain_summary_parts(),
-        )
+        self._emit_part_if_changed("chain_summary_parts", "chainSummaryPart", public_display_part(_part))
 
     def _emit_reference_feature_parts(self, _part: Part) -> None:
         # No-op: the reference feature extractor is now built by the main
         # session, so the dedicated realtime stream is no longer used.
         return
 
-    def _emit_parts_if_changed(self, event_type: str, payload_key: str, parts: list[Part]) -> None:
-        if self._realtime_parts_cache.get(event_type) == parts:
+    def _emit_part_if_changed(self, event_type: str, payload_key: str, part: Part) -> None:
+        cache_key = f"{event_type}:{part.get('id')}"
+        if not self._part_changed(cache_key, part):
             return
-        self._realtime_parts_cache[event_type] = parts
-        self._emit_realtime(event_type, {payload_key: parts})
+        self._emit_realtime(event_type, {payload_key: part})
+
+    def _part_changed(self, cache_key: str, part: Part) -> bool:
+        fingerprint = json.dumps(part, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        if self._realtime_parts_cache.get(cache_key) == fingerprint:
+            return False
+        self._realtime_parts_cache[cache_key] = fingerprint
+        return True
 
     async def send_main_user_message(self, text: str) -> list[Part]:
         self._ensure_initialized()
@@ -165,7 +415,7 @@ class HarnessOrchestrator:
         if self.dry_run:
             user_part = user_text_part(text)
             self.store.append_main_part(user_part)
-            dry_run_lines = ["Dry run mode: main session was not sent to Python Claude Code SDK."]
+            dry_run_lines = ["Dry run mode: main session was not sent to the DeepSeek Harness runtime."]
             if self.variant.node_chain:
                 dry_run_lines.append("Use `start-node <nodeType>` to exercise harness state transitions without SDK.")
             else:
@@ -176,14 +426,47 @@ class HarnessOrchestrator:
         await self._refresh_main_runner_for_dynamic_tools()
         self._ensure_main_runner()
         assert self.main_runner
-        parts = await self.main_runner.send_with_user_echo(
-            text,
-            context_text=build_main_attachment(
-                PromptContext(str(self.workspace_path), self.locale),
-                self._main_progress_snapshot(),
-                self.variant,
-            ),
+        main_attachment = build_main_attachment(
+            PromptContext(str(self.workspace_path), self.locale),
+            self._main_progress_snapshot(),
+            self.variant,
         )
+        parts = await self._send_execution_turn(
+            self.main_runner,
+            "main",
+            text,
+            context_text=main_attachment,
+        )
+        return parts
+
+    async def _send_execution_turn(
+        self,
+        runner: SdkRunner,
+        actor_id: str,
+        text: str,
+        *,
+        context_text: str | None = None,
+    ) -> list[Part]:
+        session_id = getattr(runner, "session_id", None) or f"ts-harness-{uuid4().hex}"
+        setattr(runner, "session_id", session_id)
+        await self.execution.begin(actor_id, session_id)
+        if getattr(runner, "config", None) is not None:
+            self._rotate_runner_mcp_capability(runner)
+        self._emit_runtime_snapshot()
+        try:
+            parts = await runner.send_with_user_echo(text, context_text=context_text)
+        except BaseException as exc:
+            phase = self.execution.snapshot()["phase"]
+            if phase not in {"pausing", "paused", "recovering"}:
+                await self.execution.fail(exc)
+            if getattr(runner, "config", None) is not None:
+                self._revoke_runner_mcp_capability(runner)
+            self._emit_runtime_snapshot()
+            raise
+        await self.execution.turn_finished(checkpoint_seq=getattr(runner, "checkpoint_seq", None))
+        if getattr(runner, "config", None) is not None:
+            self._revoke_runner_mcp_capability(runner)
+        self._emit_runtime_snapshot()
         return parts
 
     async def request_enter_node(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -194,8 +477,18 @@ class HarnessOrchestrator:
         self._validate_failed_node_retry_request(args)
         if self._control_mode() == "manual":
             return self._park_control_request("enter_node", args)
-        node = await self.enter_node(args)
-        return {"status": "allowed", "nodeSessionId": node["id"], "nodeType": node["nodeType"]}
+        active_id = self.state.get("activeNodeSessionId")
+        if active_id:
+            active = self.store.read_node_session(active_id)
+            if active and active.get("nodeType") == args.get("nodeType") and active.get("status") in {"running", "paused", "waiting_approval"}:
+                return {
+                    "status": "already_started",
+                    "nodeSessionId": active["id"],
+                    "nodeType": active["nodeType"],
+                    "nodeStatus": active.get("status"),
+                }
+        node = await self.enter_node(args, background=True)
+        return {"status": "started", "nodeSessionId": node["id"], "nodeType": node["nodeType"]}
 
     async def request_finish_node(self, args: dict[str, Any]) -> dict[str, Any]:
         self._ensure_initialized()
@@ -219,9 +512,14 @@ class HarnessOrchestrator:
                 f"finish_node rejected: MCP session is bound to node {node_id}, "
                 f"but active node is {active_id or 'none'}."
             )
+        node = self.store.read_node_session(node_id)
+        if not node or node.get("status") != "running":
+            raise RuntimeError(
+                f"finish_node rejected: node {node_id} is not running."
+            )
         return await self.request_finish_node(args)
 
-    async def enter_node(self, args: dict[str, Any]) -> NodeSession:
+    async def enter_node(self, args: dict[str, Any], *, background: bool = False) -> NodeSession:
         self._ensure_initialized()
         assert self.state
         node_type = args["nodeType"]
@@ -245,9 +543,7 @@ class HarnessOrchestrator:
         if self.state["activeNode"]:
             raise RuntimeError(f"Cannot enter {node_type}; active node {self.state['activeNode']} is still running.")
         # Defensive: once the pipeline is fully complete (final-summary
-        # finished, no next node), refuse to re-enter any node. The
-        # Claude Code SDK's main-session MCP transport is known to
-        # deliver tool_results with multi-hour delays; a stale
+        # finished, no next node), refuse to re-enter any node. A stale
         # enter_node from the original task would otherwise respawn
         # a runner for an already-completed node and have the agent
         # re-do work in the chat (e.g. "now writing problem-contract
@@ -285,8 +581,11 @@ class HarnessOrchestrator:
         prompt = f"请执行 {node_type} node。"
         if args.get("inputSummary"):
             prompt += f"\n\n用户/主会话补充上下文：\n{args['inputSummary']}"
+        if background:
+            self._start_node_turn(node, prompt)
+            return node
         try:
-            node_parts = await self.active_node_runner.send_with_user_echo(prompt)
+            node_parts = await self._send_execution_turn(self.active_node_runner, f"node:{node['id']}", prompt)
         except BaseException as exc:
             # The SDK call crashed before the node agent could reach
             # `finish_node`. Release the active-node lock, mark the
@@ -296,6 +595,68 @@ class HarnessOrchestrator:
             raise
         await self._handle_node_runner_return(node)
         return node
+
+    def _start_node_turn(self, node: NodeSession, prompt: str) -> None:
+        if self.is_active_node_task_running():
+            raise RuntimeError("Cannot start a node runner while another node task is still active.")
+        self._active_node_task = asyncio.create_task(self._run_node_turn_in_background(node, prompt))
+        self._emit_runtime_snapshot()
+
+    async def _run_node_turn_in_background(self, node: NodeSession, prompt: str) -> None:
+        """Run a node outside the MCP control response's lifetime."""
+        runner = self.active_node_runner
+        should_auto_advance = False
+        try:
+            if runner is None:
+                raise RuntimeError("Node runner was not initialized.")
+            actor_id = f"node:{node['id']}"
+            while True:
+                execution = self.execution.snapshot()
+                if execution["phase"] in {"paused", "failed"} and execution.get("actorId") != actor_id:
+                    return
+                if execution["phase"] not in {"running", "pausing", "recovering"}:
+                    break
+                if execution.get("actorId") == actor_id:
+                    break
+                await asyncio.sleep(0.01)
+            await self._send_execution_turn(runner, f"node:{node['id']}", prompt)
+        except BaseException as exc:
+            await self._handle_node_runner_return(node, sdk_error=exc, auto_advance=False)
+        else:
+            await self._handle_node_runner_return(node, auto_advance=False)
+            latest = self.store.read_node_session(node["id"]) or node
+            should_auto_advance = latest.get("status") == "completed" and latest.get("success") is True
+        finally:
+            # interrupt_current() owns shutdown when it pauses a node.  Do
+            # not close the captured runner a second time after its delayed
+            # transport error has been reconciled.
+            if runner is not None and self.active_node_runner is runner:
+                await self._close_node_runner_instance(runner, "node_turn_finished")
+            current = asyncio.current_task()
+            if self._active_node_task is current:
+                self._active_node_task = None
+        if should_auto_advance:
+            latest = self.store.read_node_session(node["id"]) or node
+            await self._maybe_auto_enter_next_node(latest)
+        self._emit_runtime_snapshot()
+
+    async def _close_node_runner_instance(self, runner: SdkRunner, reason: str) -> None:
+        """Close a captured runner without disturbing a successor node."""
+        if self.active_node_runner is runner:
+            self.active_node_runner = None
+        try:
+            if runner.is_running:
+                await runner.interrupt()
+            await runner.close()
+        except Exception:
+            pass
+        self._revoke_runner_mcp_capability(runner)
+        self.store.append_timeline({
+            "type": "active_node_runner_closed",
+            "timestamp": now_iso(),
+            "message": f"Active node runner closed for {reason}.",
+            "payload": {"reason": reason},
+        })
 
     async def finish_node(self, args: dict[str, Any]) -> dict[str, Any]:
         self._ensure_initialized()
@@ -336,7 +697,11 @@ class HarnessOrchestrator:
             self.state["completedNodes"].append(node["nodeType"])
         self.state["activeNode"] = None
         self.state["activeNodeSessionId"] = None
+        if node["nodeType"] == "problem-contract" and node["success"]:
+            self.state["contractReady"] = True
         if node["nodeType"] == "problem-contract" and args.get("goalMet"):
+            # Legacy field: it records the objective milestone, whereas
+            # contractReady records that the contract deliverables exist.
             self.state["contractConfirmed"] = True
         if node["nodeType"] == "final-summary" and args.get("goalMet"):
             self.state["finalSummaryConfirmed"] = True
@@ -355,7 +720,10 @@ class HarnessOrchestrator:
                 "outputPaths": node["outputPaths"],
             },
         })
-        self.active_node_runner = None
+        # Keep the runner reference until its DSH turn reaches checkpoint so a
+        # concurrent pause can still address the correct actor. The workflow
+        # session itself is terminal and must no longer receive node-scoped
+        # application writes.
         self.active_node_session = None
         next_node = self._next_node_after_completion(node) if node["success"] else None
         return {"nodeSessionId": node["id"], "nextNode": next_node}
@@ -370,6 +738,8 @@ class HarnessOrchestrator:
         self._ensure_initialized()
         self._reject_reference_feature_case_review_artifact(args.get("path"), node_type=node_type)
         node = self.store.read_node_session(node_id)
+        if node and node.get("status") == "paused":
+            raise RuntimeError(f"record_artifact rejected: node {node_id} is paused.")
         event_type = "late_after_finish" if node and node.get("status") in {"completed", "failed", "exited"} else None
         summary = args.get("summary")
         if event_type:
@@ -394,12 +764,20 @@ class HarnessOrchestrator:
         record["nodeSessionId"] = node_id
         record["nodeType"] = node_type
         node = self.store.read_node_session(node_id)
+        if node and node.get("status") == "paused":
+            raise RuntimeError(f"record_run rejected: node {node_id} is paused.")
         if node and node.get("status") in {"completed", "failed", "exited"}:
             record["status"] = f"late_after_finish:{record.get('status', 'unknown')}"
         self.store.record_run(record)
         return {"ok": True}
 
-    async def request_query_knowledge(self, args: dict[str, Any]) -> dict[str, Any]:
+    async def request_query_knowledge(
+        self,
+        args: dict[str, Any],
+        *,
+        node_session_id: str | None = None,
+        capability: str | None = None,
+    ) -> dict[str, Any]:
         if not self.variant.knowledge_query:
             raise RuntimeError(f"Knowledge queries are disabled by ablation variant {self.variant.id}.")
         if self.variant.knowledge_query_source == "graph" and not self.store.is_knowledge_graph_ready():
@@ -409,12 +787,19 @@ class HarnessOrchestrator:
             and not self.store.is_reference_feature_extractor_ready(allow_execution=False)
         ):
             raise RuntimeError("Reference feature extractor source is not ready. Build and statically validate it first.")
+        result_guard: Callable[[], None] | None = None
+        if capability:
+            self._require_current_mcp_call(capability, node_session_id)
+            result_guard = lambda: self._require_current_mcp_call(capability, node_session_id)
+        elif node_session_id:
+            raise PermissionError("Node knowledge queries require an active MCP capability.")
         return await self.query_knowledge(
             question=str(args.get("question", "")),
             domain=args.get("domain"),
             context=args.get("context") if isinstance(args.get("context"), dict) else None,
             observations=args.get("observations") if isinstance(args.get("observations"), list) else None,
             include_evidence=bool(args.get("includeEvidence", False)),
+            result_guard=result_guard,
         )
 
     def request_extract_reference_features(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -461,126 +846,58 @@ class HarnessOrchestrator:
             await self._refresh_main_runner_for_dynamic_tools()
         return status
 
+    def _preserve_active_node_lock(self, node: NodeSession) -> None:
+        """Persist the lock that makes a paused node resumable after restart."""
+        state = self.store.read_state() or self.state
+        if state is None:
+            raise RuntimeError("Workspace state is not initialized.")
+        state["activeNode"] = node["nodeType"]
+        state["activeNodeSessionId"] = node["id"]
+        self.store.write_state(state)
+        self.state = state
+
     async def interrupt_current(
         self,
         reason: str | None = None,
-        resume_mode: ResumeMode = "new_session",
     ) -> dict[str, Any]:
         self._ensure_initialized()
         assert self.state
-        if resume_mode not in RESUME_MODES:
-            raise ValueError(f"Unsupported resume mode: {resume_mode}")
-        message = reason or "Interrupted by user."
-        target = "none"
-        node_runner_active = bool(self.active_node_runner and self.active_node_runner.is_running)
-        main_runner_active = bool(self.main_runner and self.main_runner.is_running)
-        has_active_node = bool(self.state.get("activeNodeSessionId"))
-
-        if node_runner_active or (has_active_node and not main_runner_active):
-            target = "node"
-            node = self.active_node_session or self._restore_active_node_session()
-            if node and node.get("status") == "paused":
-                node["resumeMode"] = resume_mode
-                if resume_mode == "resume_rollback":
-                    self._rollback_interrupted_log(
-                        self.store.node_log_path(node["id"]),
-                        target="node",
-                        node_session_id=node["id"],
-                    )
+        current = self.execution.snapshot()
+        if current["phase"] == "paused":
+            return {"target": current["actorId"], "execution": current, "alreadyPaused": True}
+        if current["phase"] != "running":
+            raise RuntimeError(f"execution is {current['phase']}; there is no running turn to pause")
+        actor_id = str(current.get("actorId") or "")
+        runner = self.active_node_runner if actor_id.startswith("node:") else self.main_runner
+        if runner is None:
+            raise RuntimeError(f"No DSH runtime is available for active actor {actor_id or 'unknown'}.")
+        target = "node" if actor_id.startswith("node:") else "main"
+        snapshot = await self.execution.pause(runner, reason or "Paused by user.")
+        node_id = actor_id.split(":", 1)[1] if actor_id.startswith("node:") else None
+        state = self.store.read_state() or self.state
+        if node_id and state.get("activeNodeSessionId") == node_id:
+            node = self.store.read_node_session(node_id)
+            if node and node.get("status") not in {"completed", "failed", "exited"}:
+                node.update({"status": "paused", "pausedAt": now_iso(), "summary": "Paused by user."})
                 self.store.write_node_session(node)
-                await self._close_active_node_runner("user_interrupt_already_paused")
-                await self._close_main_runner(
-                    reason="user_interrupt_already_paused",
-                    message="Main runner closed while confirming a paused node.",
-                )
                 self.active_node_session = node
-                return {"target": target, "state": self.get_state(), "alreadyPaused": True}
-            if self.active_node_runner is not None:
-                session_id = getattr(self.active_node_runner, "session_id", None)
-                if node and session_id:
-                    node["sdkSessionId"] = session_id
-                await self._close_active_node_runner("user_interrupt")
-            if self.main_runner is not None:
-                await self._close_main_runner(
-                    reason="user_interrupt",
-                    message="Main runner closed while pausing active node.",
-                )
-                if main_runner_active:
-                    self.store.append_timeline({
-                        "type": "main_interrupted",
-                        "timestamp": now_iso(),
-                        "message": "Main runner interrupted while pausing active node.",
-                        "payload": {"reason": message},
-                    })
-            if node:
-                node["resumeMode"] = resume_mode
-                if resume_mode == "resume_rollback":
-                    self._rollback_interrupted_log(
-                        self.store.node_log_path(node["id"]),
-                        target="node",
-                        node_session_id=node["id"],
-                    )
-                node["status"] = "paused"
-                node["summary"] = f"Paused by user: {message}"
-                self.store.write_node_session(node)
-                self.store.append_node_part(node["id"], system_text_part(f"Harness pause: {message}"))
-                self.store.append_timeline({
-                    "type": "node_paused",
-                    "timestamp": now_iso(),
-                    "nodeSessionId": node["id"],
-                    "nodeType": node["nodeType"],
-                    "message": message,
-                    "payload": {"resumeMode": resume_mode},
-                })
-            self.store.write_state(self.state)
-            self.active_node_runner = None
-            self.active_node_session = node
-        elif main_runner_active and self.main_runner:
-            target = "main"
-            session_id = getattr(self.main_runner, "session_id", None)
-            if session_id:
-                self.state["mainSdkSessionId"] = session_id
-            self.state["mainResumeMode"] = resume_mode
-            if resume_mode == "resume_rollback":
-                self._rollback_interrupted_log(self.store.main_log_path, target="main")
-            self.store.write_state(self.state)
-            await self._close_main_runner(
-                reason="user_interrupt",
-                message="Main runner closed after user interrupt.",
-            )
-            part = system_text_part(f"Harness interrupt: {message}")
-            self.store.append_main_part(part)
-            self.store.append_timeline({
-                "type": "main_interrupted",
-                "timestamp": now_iso(),
-                "message": message,
-                "payload": {"resumeMode": resume_mode},
-            })
-        else:
-            self.store.append_timeline({"type": "interrupt_ignored", "timestamp": now_iso(), "message": "No active runner."})
-        return {"target": target, "state": self.get_state()}
+        self._emit_runtime_snapshot()
+        return {"target": target, "execution": snapshot, "state": self.get_state()}
 
-    def _rollback_interrupted_log(
-        self,
-        path: Path,
-        *,
-        target: str,
-        node_session_id: str | None = None,
-    ) -> None:
-        if not MessageLog.rollback_last_user_turn(path):
-            return
-        self.store.append_timeline({
-            "type": "interrupted_turn_rolled_back",
-            "timestamp": now_iso(),
-            "nodeSessionId": node_session_id,
-            "message": f"Rolled back the interrupted {target} turn in the workspace transcript.",
-            "payload": {"target": target, "resumeMode": "resume_rollback"},
-        })
+    async def force_stop_current(self) -> dict[str, Any]:
+        current = self.execution.snapshot()
+        actor_id = str(current.get("actorId") or "")
+        runner = self.active_node_runner if actor_id.startswith("node:") else self.main_runner
+        if runner is None:
+            raise RuntimeError(f"No runtime is available to force-stop actor {actor_id or 'unknown'}.")
+        snapshot = await self.execution.force_stop(runner)
+        self._emit_runtime_snapshot()
+        return {"execution": snapshot, "state": self.get_state()}
 
     async def _resume_active_node(self, text: str, node: NodeSession) -> list[Part]:
         assert self.state
-        resume_mode = node.get("resumeMode", "new_session")
         node["status"] = "running"
+        node.pop("pausedAt", None)
         node["summary"] = "Resumed with user guidance."
         self.store.write_node_session(node)
         self.active_node_session = node
@@ -590,7 +907,6 @@ class HarnessOrchestrator:
             "nodeSessionId": node["id"],
             "nodeType": node["nodeType"],
             "message": text[:500],
-            "payload": {"resumeMode": resume_mode},
         })
         if self.dry_run:
             part = system_text_part("Dry run mode: paused node received resume guidance.")
@@ -598,29 +914,14 @@ class HarnessOrchestrator:
             return [part]
         self._spawn_node_runner(node)
         assert self.active_node_runner
-        resume_instruction = ""
-        if resume_mode == "resume_rollback":
-            resume_instruction = (
-                "上一轮执行已被用户回退。请把上一轮未完成的用户请求和 assistant 输出视为不存在，"
-                "不要继续上一轮卡住的推理或工具调用，只基于回退前的有效状态和本次说明重新规划。"
-            )
         prompt = "\n".join([
             f"请继续执行 {node['nodeType']} node。此前节点被用户暂时中断，现在用户补充了以下说明：",
-            resume_instruction,
-            "",
             text,
             "",
             "请结合已有 workspace 文件、节点日志和这条补充说明继续推进当前 node。不要重新开始整个 pipeline，除非用户明确要求。",
         ])
-        node["resumeMode"] = "new_session"
-        self.store.write_node_session(node)
-        try:
-            parts = await self.active_node_runner.send_with_user_echo(prompt)
-        except BaseException as exc:
-            await self._handle_node_runner_return(node, sdk_error=exc)
-            raise
-        await self._handle_node_runner_return(node)
-        return parts
+        self._start_node_turn(node, prompt)
+        return []
 
     async def approve_pending_control(self) -> dict[str, Any]:
         self._ensure_initialized()
@@ -638,7 +939,7 @@ class HarnessOrchestrator:
             "payload": request,
         })
         if request["kind"] == "enter_node":
-            result = await self.enter_node(request["args"])
+            result = await self.enter_node(request["args"], background=True)
             return {"approved": True, "result": result, "state": self.get_state()}
         if request["kind"] == "finish_node":
             result = await self.finish_node(request["args"])
@@ -684,28 +985,27 @@ class HarnessOrchestrator:
         assert self.state
         return self.state
 
-    def get_timeline(self) -> list[dict[str, Any]]:
+    def get_timeline(self, limit: int | None = 500) -> list[dict[str, Any]]:
         self._ensure_initialized()
-        return self.store.read_timeline()
+        return self.store.read_timeline(limit=limit)
 
-    def get_main_parts(self) -> list[Part]:
+    def get_main_parts(self, limit: int | None = 200) -> list[Part]:
         self._ensure_initialized()
-        return self.store.read_main_parts()
+        return self.store.read_main_parts(limit=limit)
 
     def get_node_sessions(self) -> list[NodeSession]:
         self._ensure_initialized()
         return self.store.list_node_sessions()
 
-    def get_node_parts(self, node_session_id: str) -> list[Part]:
+    def get_node_parts(self, node_session_id: str, limit: int | None = 200) -> list[Part]:
         self._ensure_initialized()
-        return self.store.read_node_parts(node_session_id)
+        return self.store.read_node_parts(node_session_id, limit=limit)
 
-    def get_node_parts_by_id(self, limit_per_node: int = 1000) -> dict[str, list[Part]]:
+    def get_node_parts_by_id(self, limit_per_node: int = 200) -> dict[str, list[Part]]:
         self._ensure_initialized()
         out: dict[str, list[Part]] = {}
         for node in self.get_node_sessions():
-            parts = self.store.read_node_parts(node["id"])
-            out[node["id"]] = parts[-limit_per_node:]
+            out[node["id"]] = self.store.read_node_parts(node["id"], limit=limit_per_node)
         return out
 
     def get_file_tree(self) -> dict[str, Any]:
@@ -750,11 +1050,11 @@ class HarnessOrchestrator:
         self._ensure_initialized()
         return self.store.read_knowledge_graph_build_status()
 
-    def get_knowledge_graph_parts(self) -> list[Part]:
+    def get_knowledge_graph_parts(self, limit: int | None = 200) -> list[Part]:
         self._ensure_initialized()
         if not self.variant.knowledge_graph:
             return []
-        return self.store.read_knowledge_graph_parts()
+        return self.store.read_knowledge_graph_parts(limit=limit)
 
     def get_chain_summary(self) -> dict[str, Any]:
         self._ensure_initialized()
@@ -764,9 +1064,9 @@ class HarnessOrchestrator:
         self._ensure_initialized()
         return self.store.read_chain_summary_status()
 
-    def get_chain_summary_parts(self) -> list[Part]:
+    def get_chain_summary_parts(self, limit: int | None = 200) -> list[Part]:
         self._ensure_initialized()
-        return self.store.read_chain_summary_parts()
+        return self.store.read_chain_summary_parts(limit=limit)
 
     def get_reference_feature_status(self) -> dict[str, Any]:
         self._ensure_initialized()
@@ -816,6 +1116,7 @@ class HarnessOrchestrator:
         context: dict[str, Any] | None = None,
         observations: list[str] | None = None,
         include_evidence: bool = False,
+        result_guard: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         self._ensure_initialized()
         if not self.variant.knowledge_query:
@@ -857,6 +1158,8 @@ class HarnessOrchestrator:
                 observations=observations,
                 include_evidence=include_evidence,
             )
+        if result_guard:
+            result_guard()
         self.store.append_timeline({
             "type": "knowledge_query_answered",
             "timestamp": now_iso(),
@@ -1238,6 +1541,23 @@ class HarnessOrchestrator:
             self._stamp_variant_state()
             self.active_node_session = None
 
+    async def reset_workflow_preserving_assets(self) -> WorkspaceState:
+        """Reset orchestration state while retaining user-provided assets."""
+        self._ensure_initialized()
+        if self.is_active_node_task_running() or (self.main_runner and self.main_runner.is_running):
+            raise RuntimeError("Cannot reset workflow while a harness task is active.")
+        await self._close_main_runner(
+            reason="workflow_reset_preserving_assets",
+            message="Main runner closed for workflow reset while preserving uploaded assets.",
+        )
+        await self._close_active_node_runner("workflow_reset_preserving_assets")
+        self.state = self.store.reset_workflow_preserving_assets()
+        self._stamp_variant_state()
+        self.active_node_session = None
+        self._active_node_task = None
+        self._emit_runtime_snapshot()
+        return self.state
+
     def get_node_specs(self) -> list[dict[str, Any]]:
         if not self.variant.node_chain:
             return []
@@ -1314,6 +1634,7 @@ class HarnessOrchestrator:
         node: NodeSession,
         *,
         sdk_error: BaseException | None = None,
+        auto_advance: bool = True,
     ) -> None:
         """Reconcile node session state after a node runner turn ends.
 
@@ -1342,6 +1663,17 @@ class HarnessOrchestrator:
         self.state = self.store.read_state()
         latest = self.store.read_node_session(node["id"]) or node
         if sdk_error is not None:
+            if self.execution.snapshot()["phase"] in {"pausing", "paused", "recovering"}:
+                if latest.get("status") in {"completed", "failed", "exited"}:
+                    # A terminal workflow transition committed before the DSH
+                    # pause boundary. Pause may retire the runtime, but must not
+                    # roll application state back to a resumable node.
+                    return
+                latest.update({"status": "paused", "pausedAt": now_iso(), "summary": "Paused by user."})
+                self.store.write_node_session(latest)
+                self._preserve_active_node_lock(latest)
+                self.active_node_session = latest
+                return
             # If the user already resolved the node session (e.g. by
             # clicking Interrupt, which sets status=paused), the SDK
             # error is just a delayed side effect of that intervention
@@ -1363,15 +1695,12 @@ class HarnessOrchestrator:
         if latest.get("status") == "waiting_approval":
             return
         if latest.get("status") == "completed":
-            if self._control_mode() == "auto":
+            if auto_advance and self._control_mode() == "auto":
                 await self._maybe_auto_enter_next_node(latest)
             # Once the pipeline is fully complete (no more auto-next
-            # node), close the long-lived main runner. The Claude Code
-            # SDK has a known issue where the main session's MCP
-            # transport delays tool_result delivery by hours. Closing
-            # the runner here terminates the CLI subprocess and its
-            # in-memory buffers so any stale tool_results from the
-            # main session's earlier enter_node call are dropped
+            # node), close the long-lived DSH runtime. This releases
+            # the session-owned child processes and prevents a stale
+            # main turn from acting on a completed pipeline.
             # instead of being processed and re-entering an already-
             # completed node.
             if self._is_pipeline_complete():
@@ -1392,6 +1721,15 @@ class HarnessOrchestrator:
         network drop, etc.). Release the active-node lock so the
         orchestrator can recover on the next main turn. The original
         exception is re-raised by the caller."""
+        # The SDK shutdown can race with a user pause between the caller's
+        # initial status read and this failure path.  Re-read durable state
+        # immediately before emitting failure artifacts so a deliberate pause
+        # always wins the race.
+        current = self.store.read_node_session(node["id"])
+        if current and current.get("status") == "paused":
+            self._preserve_active_node_lock(current)
+            self.active_node_session = current
+            return
         reason = f"Node SDK runner crashed: {type(sdk_error).__name__}: {sdk_error}"
         self.store.append_timeline({
             "type": "node_runner_crash",
@@ -1426,6 +1764,16 @@ class HarnessOrchestrator:
         if self.active_node_runner is not None:
             await self._close_active_node_runner(reason)
         self.active_node_runner = None
+        state = self.store.read_state() or self.state
+        paused = (
+            self.store.read_node_session(state["activeNodeSessionId"])
+            if state and state.get("activeNodeSessionId")
+            else None
+        )
+        if paused and paused.get("status") == "paused":
+            self._preserve_active_node_lock(paused)
+            self.active_node_session = paused
+            return
         self.active_node_session = None
         if self.state is not None:
             self.state["activeNode"] = None
@@ -1497,7 +1845,9 @@ class HarnessOrchestrator:
             await self._handle_node_runner_return(latest)
             return
         try:
-            await self.active_node_runner.send_with_user_echo(
+            await self._send_execution_turn(
+                self.active_node_runner,
+                f"node:{latest['id']}",
                 "[Harness reminder] This turn must end with mcp__ts_harness__finish_node. "
                 "Inspect the current workspace and node log, then call finish_node."
             )
@@ -1511,11 +1861,10 @@ class HarnessOrchestrator:
         reason: str = "pipeline_complete",
         message: str = "Main runner closed (pipeline complete); late tool_results from the main session will be discarded.",
     ) -> None:
-        """Terminate the long-lived main runner and its Claude Code CLI
-        subprocess. Used to discard any pending, possibly hours-stale
-        tool_results from the main session's earlier enter_node call so
-        they don't get re-processed and re-enter an already-completed
-        node.
+        """Terminate the long-lived DeepSeek Harness runtime subprocess.
+
+        This releases its JSON-RPC session and MCP child process.  A later
+        resume can restore its durable DSH session/checkpoint when requested.
 
         Safe to call multiple times; subsequent calls are no-ops."""
         runner = self.main_runner
@@ -1533,6 +1882,7 @@ class HarnessOrchestrator:
             await runner.close()
         except Exception:
             pass
+        self._revoke_runner_mcp_capability(runner)
         self.store.append_timeline({
             "type": "main_runner_closed",
             "timestamp": now_iso(),
@@ -1554,6 +1904,7 @@ class HarnessOrchestrator:
             await runner.close()
         except Exception:
             pass
+        self._revoke_runner_mcp_capability(runner)
         self.store.append_timeline({
             "type": "active_node_runner_closed",
             "timestamp": now_iso(),
@@ -1584,7 +1935,7 @@ class HarnessOrchestrator:
             "nodeType": next_node,
             "rationale": f"Previous node {latest['nodeType']} completed successfully; continuing node chain.",
             "inputSummary": f"Upstream node {latest['nodeType']} completed. Summary: {latest.get('summary', '')}. Output paths: {', '.join(latest.get('outputPaths', []))}",
-        })
+        }, background=True)
 
     def _is_pipeline_complete(self) -> bool:
         """Return true when the persisted node chain has fully completed.
@@ -1742,12 +2093,10 @@ class HarnessOrchestrator:
             apiKey=graph.get("apiKey") or main.apiKey,
             baseUrl=graph.get("baseUrl") or main.baseUrl,
             protocol=graph.get("protocol") or main.protocol,
-            contextWindow=graph.get("contextWindow") or main.contextWindow,
         )
 
     def _llm_config_from_dict(self, raw: dict[str, Any]) -> LlmConfig:
-        protocol = raw.get("protocol") if raw.get("protocol") in {"anthropic", "openai-compat"} else None
-        context = raw.get("contextWindow") if raw.get("contextWindow") in {"200k", "1m"} else None
+        protocol = raw.get("protocol") if raw.get("protocol") in {"deepseek", "openai-compat"} else None
         auth = raw.get("authMode") if raw.get("authMode") in {"manual", "sdk-default"} else "manual"
         return LlmConfig(
             authMode=auth,
@@ -1755,7 +2104,6 @@ class HarnessOrchestrator:
             apiKey=raw.get("apiKey") if isinstance(raw.get("apiKey"), str) else None,
             baseUrl=raw.get("baseUrl") if isinstance(raw.get("baseUrl"), str) else None,
             protocol=protocol,
-            contextWindow=context,
         )
 
     def _restore_active_node_session(self) -> NodeSession | None:
@@ -1843,10 +2191,7 @@ class HarnessOrchestrator:
         if self.main_runner:
             return
         current_state = self.store.read_state() or self.state
-        resume_mode = current_state.get("mainResumeMode", "new_session") if current_state else "new_session"
-        resume_session_id = None
-        if resume_mode in {"resume_keep", "resume_rollback"} and current_state:
-            resume_session_id = current_state.get("mainSdkSessionId")
+        resume_session_id = current_state.get("mainSdkSessionId") if current_state else None
 
         def on_session_id(sdk_session_id: str) -> None:
             latest_state = self.store.read_state() or self.state
@@ -1872,10 +2217,6 @@ class HarnessOrchestrator:
             on_session_id=on_session_id,
             resume_session_id=resume_session_id,
         )
-        if current_state:
-            current_state["mainResumeMode"] = "new_session"
-            self.store.write_state(current_state)
-            self.state = current_state
         self._main_runner_knowledge_graph_ready = knowledge_query_ready
         self._main_runner_reference_feature_ready = reference_feature_ready
 
@@ -1897,12 +2238,24 @@ class HarnessOrchestrator:
     def _spawn_node_runner(self, node: NodeSession) -> None:
         node_id = node["id"]
         node_type = node["nodeType"]
-        resume_mode = node.get("resumeMode", "new_session")
-        resume_session_id = node.get("sdkSessionId") if resume_mode in {"resume_keep", "resume_rollback"} else None
+        resume_session_id = node.get("sdkSessionId")
+        run_epoch = int(node.get("runEpoch", 0) or 0) + 1
+        node["runEpoch"] = run_epoch
+        self.store.write_node_session(node)
 
         def on_session_id(sdk_session_id: str) -> None:
-            node["sdkSessionId"] = sdk_session_id
-            self.store.write_node_session(node)
+            latest = self.store.read_node_session(node_id)
+            state = self.store.read_state() or self.state
+            if not (
+                latest
+                and latest.get("status") in {"running", "paused"}
+                and latest.get("runEpoch") == run_epoch
+                and state
+                and state.get("activeNodeSessionId") == node_id
+            ):
+                return
+            latest["sdkSessionId"] = sdk_session_id
+            self.store.write_node_session(latest)
 
         self.active_node_runner = build_node_runner(
             workspace_path=self.workspace_path,

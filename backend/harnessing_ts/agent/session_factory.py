@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from harnessing_ts.agent.sdk_runner import SdkRunner, SdkRunnerConfig
-from harnessing_ts.mcp.server import create_harness_mcp_server
 from harnessing_ts.prompts.compose import (
     PromptContext,
     build_main_system_prompt,
@@ -36,16 +35,6 @@ def build_main_runner(
     variant = variant or get_variant(DEFAULT_VARIANT_ID)
     ctx = PromptContext(str(workspace_path), locale)
     sdk_config = build_sdk_invocation_config(read_effective_llm_config(workspace_path))
-    mcp_server = create_harness_mcp_server(
-        session_role="main",
-        enter_node=enter_node,
-        query_knowledge=query_knowledge,
-        extract_reference_features=extract_reference_features,
-        inspect_reference_feature_extractor=inspect_reference_feature_extractor,
-        validate_reference_feature_extractor=validate_reference_feature_extractor,
-    )
-    if mcp_server is None:
-        raise RuntimeError("Claude Code SDK Harness MCP server could not be created.")
     return SdkRunner(SdkRunnerConfig(
         cwd=workspace_path,
         system_prompt=build_main_system_prompt(ctx, variant),
@@ -56,9 +45,10 @@ def build_main_runner(
             variant=variant,
         ),
         model=sdk_config.model,
+        provider=sdk_config.provider,
+        max_tokens=sdk_config.max_tokens,
         env=sdk_config.env,
-        extra_args=sdk_config.extra_args,
-        mcp_server=mcp_server,
+        session_role="main",
         log=MessageLog(log_path),
         on_part=on_part,
         on_session_id=on_session_id,
@@ -89,19 +79,6 @@ def build_node_runner(
     ctx = PromptContext(str(workspace_path), locale)
     sdk_config = build_sdk_invocation_config(read_effective_llm_config(workspace_path))
     node_type: NodeType = node["nodeType"]
-    mcp_server = create_harness_mcp_server(
-        session_role="node",
-        finish_node=finish_node,
-        query_knowledge=query_knowledge,
-        extract_reference_features=extract_reference_features,
-        inspect_reference_feature_extractor=inspect_reference_feature_extractor,
-        validate_reference_feature_extractor=validate_reference_feature_extractor,
-        record_artifact=record_artifact,
-        record_run=record_run,
-        get_runtime_settings=get_runtime_settings,
-    )
-    if mcp_server is None:
-        raise RuntimeError("Claude Code SDK MCP server is required for node control but could not be created.")
     return SdkRunner(SdkRunnerConfig(
         cwd=workspace_path,
         system_prompt=build_node_system_prompt(node_type, ctx, variant),
@@ -113,9 +90,11 @@ def build_node_runner(
             variant=variant,
         ),
         model=sdk_config.model,
+        provider=sdk_config.provider,
+        max_tokens=sdk_config.max_tokens,
         env=sdk_config.env,
-        extra_args=sdk_config.extra_args,
-        mcp_server=mcp_server,
+        session_role="node",
+        node_session_id=node["id"],
         log=MessageLog(log_path),
         on_session_id=on_session_id,
         on_part=on_part,

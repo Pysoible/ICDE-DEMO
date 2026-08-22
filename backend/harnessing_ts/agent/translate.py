@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
+import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -69,9 +70,114 @@ def sdk_message_to_part(message: Any) -> Part:
     return {"id": str(uuid4()), "timestamp": timestamp, "role": "system", "type": "raw", "text": str(raw.get("subtype") or msg_type or ""), "raw": raw}
 
 
+def dsh_event_to_parts(
+    event: Any,
+    *,
+    part_id: str | None = None,
+    timestamp: str | None = None,
+) -> list[Part]:
+    """Project DSH JSON-RPC events into the provider-neutral transcript schema.
+
+    DSH reports a call and its result as separate session events.  Keeping the
+    callId as toolUseId lets MessageLog merge them into the same semantic tool
+    card used by the former Claude Code SDK integration.
+    """
+    if not isinstance(event, dict):
+        return []
+    event_type = event.get("type")
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    base_id = part_id or str(uuid4())
+    event_timestamp = timestamp or _now()
+
+    if event_type == "assistant/message":
+        message = data.get("message") if isinstance(data.get("message"), dict) else data
+        content = message.get("content") if isinstance(message, dict) else None
+        text = "".join(
+            str(block.get("text") or "")
+            for block in content or []
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+        if not text:
+            return []
+        return [{
+            "id": base_id,
+            "timestamp": event_timestamp,
+            "role": "assistant",
+            "type": "text",
+            "text": text,
+            "raw": event,
+        }]
+
+    if event_type == "tool/call":
+        name = data.get("name") if isinstance(data.get("name"), str) else "tool"
+        input_value = _dsh_arguments(data.get("arguments"))
+        call_id = data.get("callId")
+        return [{
+            "id": base_id,
+            "timestamp": event_timestamp,
+            "role": "assistant",
+            "type": "tool_call",
+            "name": name,
+            "input": input_value,
+            "intend": _extract_intend(input_value, name),
+            "toolUseId": call_id if isinstance(call_id, str) else None,
+            "status": "pending",
+            "text": _extract_intend(input_value, name),
+            "raw": event,
+        }]
+
+    if event_type == "tool/result":
+        message = data.get("message") if isinstance(data.get("message"), dict) else {}
+        source = message.get("source") if isinstance(message.get("source"), dict) else {}
+        source_call_id = source.get("callId") if isinstance(source.get("callId"), str) else None
+        content = message.get("content") if isinstance(message.get("content"), list) else []
+        parts: list[Part] = []
+        for index, block in enumerate(content):
+            if not isinstance(block, dict) or block.get("type") != "tool-result":
+                continue
+            call_id = block.get("toolCallId") if isinstance(block.get("toolCallId"), str) else source_call_id
+            failed = block.get("isError") is True
+            result_text = _format_tool_result(block.get("content"), None)
+            parts.append({
+                "id": base_id if index == 0 else f"{base_id}:{index}",
+                "timestamp": event_timestamp,
+                "role": "tool",
+                "type": "tool_result",
+                "toolUseId": call_id,
+                "status": "failed" if failed else "completed",
+                "resultText": result_text,
+                "text": result_text,
+                "raw": event,
+            })
+        return parts
+
+    return []
+
+
+def project_dsh_tool_events(parts: list[Part]) -> list[Part]:
+    """Read old raw DSH tool events as semantic cards without rewriting audit logs."""
+    projected: list[Part] = []
+    for part in parts:
+        raw = part.get("raw")
+        if (
+            part.get("role") == "system"
+            and part.get("type") == "raw"
+            and isinstance(raw, dict)
+            and raw.get("type") in {"tool/call", "tool/result"}
+        ):
+            projected.extend(dsh_event_to_parts(
+                raw,
+                part_id=part.get("id") if isinstance(part.get("id"), str) else None,
+                timestamp=part.get("timestamp") if isinstance(part.get("timestamp"), str) else None,
+            ))
+            continue
+        projected.append(part)
+    return projected
+
+
 def merge_tool_result_part(tool_call: Part, tool_result: Part) -> Part:
     merged = dict(tool_call)
-    merged["status"] = "completed"
+    merged["status"] = "failed" if tool_result.get("status") == "failed" else "completed"
     merged["resultText"] = _strip_reasoning_jsonl_lines(tool_result.get("resultText") or tool_result.get("text") or "")
     merged["resultRaw"] = tool_result.get("raw")
     merged["text"] = merged.get("intend") or _format_tool_use(merged.get("name"), merged.get("input"))
@@ -105,8 +211,63 @@ def collapse_tool_parts(parts: list[Part]) -> list[Part]:
     return out
 
 
+def _dsh_arguments(value: Any) -> Any:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {"rawArguments": value}
+        return parsed
+    return {}
+
+
 def filter_display_parts(parts: list[Part]) -> list[Part]:
-    return [_sanitize_display_part(part) for part in parts if not is_ignorable_display_part(part)]
+    """Return the bounded public projection of an audit transcript.
+
+    The JSONL transcript intentionally retains the provider event so an
+    operator can audit a run.  That object can contain full shell output,
+    tool arguments, and provider-only metadata, and must not be embedded in
+    a bootstrap/SSE payload merely because a UI happens not to render it.
+    """
+    return [public_display_part(_sanitize_display_part(part)) for part in parts if not is_ignorable_display_part(part)]
+
+
+_PUBLIC_PART_KEYS = {
+    "id", "timestamp", "role", "type", "text", "name", "input", "intend",
+    "toolUseId", "status", "resultText", "displayText", "sourceLabel",
+}
+_PUBLIC_TEXT_LIMIT = 6_000
+_PUBLIC_INPUT_LIMIT = 2_000
+
+
+def public_display_part(part: Part) -> Part:
+    """Remove audit-only payloads and cap display strings before transport."""
+    public = {key: value for key, value in part.items() if key in _PUBLIC_PART_KEYS}
+    for key in ("text", "intend", "resultText", "displayText"):
+        value = public.get(key)
+        if isinstance(value, str):
+            public[key] = _truncate_display_text(value, _PUBLIC_TEXT_LIMIT)
+    if "input" in public:
+        public["input"] = _bounded_display_value(public["input"], _PUBLIC_INPUT_LIMIT)
+    return public
+
+
+def _truncate_display_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "\n… [已截断；完整审计记录保存在 workspace JSONL 日志中]"
+
+
+def _bounded_display_value(value: Any, limit: int) -> Any:
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return _truncate_display_text(str(value), limit)
+    if len(encoded) <= limit:
+        return value
+    return {"displaySummary": _truncate_display_text(encoded, limit), "truncated": True}
 
 
 def _sanitize_display_part(part: Part) -> Part:
@@ -271,8 +432,6 @@ def _format_tool_use(name: Any, input_value: Any) -> str:
     label = name if isinstance(name, str) else "tool"
     if input_value is None:
         return f"Tool call: {label}"
-    import json
-
     return f"Tool call: {label}\n{json.dumps(input_value, ensure_ascii=False, indent=2)}"
 
 
@@ -348,8 +507,6 @@ def _format_tool_result(content: Any, structured: Any) -> str:
     if extracted:
         return _strip_reasoning_jsonl_lines(extracted)
     if structured is not None:
-        import json
-
         return _strip_reasoning_jsonl_lines(json.dumps(structured, ensure_ascii=False, indent=2))
     return "Tool result"
 
@@ -373,8 +530,6 @@ def _is_ignorable_reasoning_json_line(line: str) -> bool:
     if not (stripped.startswith("{") and stripped.endswith("}")):
         return False
     try:
-        import json
-
         parsed = json.loads(stripped)
     except Exception:
         return False

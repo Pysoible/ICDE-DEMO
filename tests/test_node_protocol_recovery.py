@@ -4,12 +4,12 @@ The harness guards against the case where a node runner returns
 without calling `mcp__ts_harness__finish_node`. There are two
 subcases:
 
-1. The Claude Code SDK call itself crashes (control-request timeout,
+1. The DeepSeek Harness runtime call itself crashes (control-request timeout,
    subprocess error, network drop, etc.). The harness must mark the
    node as failed with the SDK error in the summary, release the
    active-node lock so the next main turn isn't blocked, and re-raise
    the original exception to the HTTP caller. If the user already
-   paused the node, the delayed SDK error must preserve the paused
+   paused the node, the delayed runtime error must preserve the paused
    active node so the user can resume it.
 
 2. The SDK call returns normally but the agent never called
@@ -18,7 +18,7 @@ subcases:
    finish, the harness gives up and marks the node as failed so the
    lock is released.
 
-These tests exercise both paths without invoking a live SDK; they
+These tests exercise both paths without invoking a live runtime; they
 inject a fake SdkRunner into the orchestrator and drive the
 `_handle_node_runner_return` flow.
 """
@@ -84,6 +84,25 @@ class _FakeNodeRunner:
 
     async def close(self) -> None:
         self.is_running = False
+
+
+class _InterruptingNodeRunner(_FakeNodeRunner):
+    """Raises the transport error only after the pause path shuts it down."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send_with_user_echo(self, text: str, context_text: str | None = None) -> list[dict[str, Any]]:
+        self.user_messages.append(text)
+        self.started.set()
+        await self.release.wait()
+        raise RuntimeError("DeepSeek Harness runtime stdout closed")
+
+    async def interrupt(self) -> None:
+        self.is_running = False
+        self.release.set()
 
 
 def test_handle_node_runner_return_reminds_then_gives_up_when_agent_still_does_not_finish(tmp_path) -> None:
@@ -243,8 +262,15 @@ def test_resume_active_node_swallows_sdk_exception_after_marking_failure(tmp_pat
     fake_runner.raise_on[0] = RuntimeError("SDK subprocess crashed")
     orchestrator._spawn_node_runner = lambda node: setattr(orchestrator, "active_node_runner", fake_runner)  # type: ignore[assignment]
 
-    with pytest.raises(RuntimeError, match="SDK subprocess crashed"):
-        asyncio.run(orchestrator._resume_active_node("continue with more detail", node))
+    async def resume_and_wait() -> None:
+        result = await orchestrator._resume_active_node("continue with more detail", node)
+        assert result == []
+        for _ in range(20):
+            if not orchestrator.is_active_node_task_running():
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(resume_and_wait())
 
     state = orchestrator.get_state()
     assert state["activeNode"] is None
@@ -252,6 +278,27 @@ def test_resume_active_node_swallows_sdk_exception_after_marking_failure(tmp_pat
     assert latest is not None
     assert latest.get("status") == "failed"
     assert "SDK subprocess crashed" in (latest.get("summary") or "")
+
+
+def test_resume_active_node_clears_pause_timestamp(tmp_path) -> None:
+    orchestrator = _make_orchestrator(tmp_path)
+    orchestrator.dry_run = True
+    node = _create_running_node(orchestrator, "problem-contract")
+    node.update({
+        "status": "paused",
+        "pausedAt": "2026-08-22T14:50:57Z",
+        "summary": "Paused by user.",
+    })
+    orchestrator.store.write_node_session(node)
+
+    result = asyncio.run(orchestrator._resume_active_node("continue", node))
+
+    assert result
+    resumed = orchestrator.store.read_node_session(node["id"])
+    assert resumed is not None
+    assert resumed["status"] == "running"
+    assert "pausedAt" not in resumed
+    assert resumed["summary"] == "Resumed with user guidance."
 
 
 def test_send_main_user_message_unblocked_after_protocol_failure(tmp_path) -> None:
@@ -305,70 +352,31 @@ def test_handle_node_runner_return_sdk_error_preserves_user_pause(tmp_path) -> N
     assert not any(event["type"] == "node_protocol_error" for event in timeline)
 
 
-def test_interrupt_current_is_idempotent_for_already_paused_node(tmp_path) -> None:
+def test_terminal_node_state_wins_over_concurrent_pause_cleanup(tmp_path) -> None:
     orchestrator = _make_orchestrator(tmp_path)
     node = _create_running_node(orchestrator, "problem-contract")
-    node["status"] = "paused"
-    node["summary"] = "Paused by user: needs guidance"
+    node.update({"status": "completed", "success": True, "summary": "done"})
     orchestrator.store.write_node_session(node)
+    state = orchestrator.store.read_state()
+    state["activeNode"] = None
+    state["activeNodeSessionId"] = None
+    orchestrator.store.write_state(state)
+    execution = orchestrator.execution.ensure_actor(f"node:{node['id']}", "session-1")
+    execution["phase"] = "paused"
+    orchestrator.store.write_execution(execution)
 
-    result = asyncio.run(orchestrator.interrupt_current("second click"))
-
-    latest = orchestrator.store.read_node_session(node["id"])
-    assert latest is not None
-    assert latest["status"] == "paused"
-    assert latest["summary"] == "Paused by user: needs guidance"
-    assert result["alreadyPaused"] is True
-    node_parts = orchestrator.store.read_node_parts(node["id"])
-    assert not any("second click" in str(part.get("text", "")) for part in node_parts)
-
-
-def test_interrupt_current_closes_node_and_main_runners(tmp_path) -> None:
-    orchestrator = _make_orchestrator(tmp_path)
-    node = _create_running_node(orchestrator, "problem-contract")
-    node_runner = _FakeNodeRunner()
-    main_runner = _FakeNodeRunner()
-    orchestrator.active_node_runner = node_runner  # type: ignore[assignment]
-    orchestrator.main_runner = main_runner  # type: ignore[assignment]
-
-    result = asyncio.run(orchestrator.interrupt_current("stop all runners"))
+    asyncio.run(orchestrator._handle_node_runner_return(
+        node,
+        sdk_error=RuntimeError("Paused by user."),
+        auto_advance=False,
+    ))
 
     latest = orchestrator.store.read_node_session(node["id"])
-    assert latest is not None
-    assert latest["status"] == "paused"
-    assert result["target"] == "node"
-    assert not node_runner.is_running
-    assert not main_runner.is_running
-    assert orchestrator.active_node_runner is None
-    assert orchestrator.main_runner is None
-    timeline = orchestrator.store.read_timeline()
-    assert any(event["type"] == "active_node_runner_closed" for event in timeline)
-    assert any(event["type"] == "main_runner_closed" for event in timeline)
+    assert latest["status"] == "completed"
+    assert latest["summary"] == "done"
+    assert orchestrator.get_state()["activeNodeSessionId"] is None
 
 
-def test_interrupt_current_persists_resume_mode_and_rolls_back_transcript(tmp_path) -> None:
-    orchestrator = _make_orchestrator(tmp_path)
-    node = _create_running_node(orchestrator, "problem-contract")
-    orchestrator.store.append_node_part(node["id"], user_text_part("the stalled request"))
-    orchestrator.store.append_node_part(node["id"], {
-        "id": "unfinished-response",
-        "timestamp": "2026-08-20T00:00:00Z",
-        "role": "assistant",
-        "type": "text",
-        "text": "a long unfinished response",
-    })
-    orchestrator.active_node_runner = _FakeNodeRunner()  # type: ignore[assignment]
-
-    asyncio.run(orchestrator.interrupt_current("rollback stalled turn", "resume_rollback"))
-
-    latest = orchestrator.store.read_node_session(node["id"])
-    assert latest is not None
-    assert latest["resumeMode"] == "resume_rollback"
-    parts = orchestrator.store.read_node_parts(node["id"])
-    assert not any(part.get("text") == "the stalled request" for part in parts)
-    assert not any(part.get("text") == "a long unfinished response" for part in parts)
-    timeline = orchestrator.store.read_timeline()
-    assert any(event["type"] == "interrupted_turn_rolled_back" for event in timeline)
 
 
 def test_protocol_recovery_does_not_corrupt_timeline_jsonl(tmp_path) -> None:

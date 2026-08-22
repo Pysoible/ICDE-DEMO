@@ -122,19 +122,13 @@ This is model-facing text.
 
 ### `nodes/<node-type>/native-tools.md`
 
-Native Claude Code tools visible to this node before harness MCP/text-control tools are added.
+Native DeepSeek Harness tools declared as candidates for this node before HarnessingTS MCP/text-control tools are added. The final DSH tool schema is further filtered by the active variant and deployment settings: `web_fetch` / `web_search` require their explicit environment opt-ins, and subagent tools require the `SUB` capability.
 One tool per Markdown list item.
 
 Example:
 
 ```text
-- Read
-- LS
-- Glob
-- Grep
-- Write
-- Edit
-- Bash
+- bash
 ```
 
 This file is used by `backend/harnessing_ts/tools/compose_tools.py`.

@@ -108,7 +108,7 @@ def test_variant_capabilities_change_actual_tool_permissions() -> None:
     assert "mcp__ts_harness__validate_reference_feature_extractor" in build_main_allowed_tools(variant=get_variant(RQA_FULL))
     assert "mcp__ts_harness__validate_reference_feature_extractor" not in build_main_allowed_tools(variant=get_variant(RQA_NO_TOOLS))
     assert "mcp__ts_harness__enter_node" not in build_main_allowed_tools(variant=get_variant(DIRECT))
-    assert "Bash" in build_main_allowed_tools(variant=get_variant(DIRECT))
+    assert "bash" in build_main_allowed_tools(variant=get_variant(DIRECT))
     assert "mcp__ts_harness__validate_reference_feature_extractor" in build_main_allowed_tools(variant=get_variant(FQA_NO_EXEC_CASE))
     assert "mcp__ts_harness__extract_reference_features" not in build_main_allowed_tools(
         reference_feature_extractor_ready=True,

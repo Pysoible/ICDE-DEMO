@@ -1,0 +1,140 @@
+# DeepSeek Harness runtime used by HarnessingTS.  It is based on the official
+# Python SDK runtime composition and adds the official DSH MCP client bridge.
+# The bridge receives the current runner role through its explicitly forwarded
+# environment; DSH intentionally scrubs ambient DSH_* values for child tools.
+- id: sdk-jsonrpc-server
+  name: '../../../dsh_runtime/session-jsonrpc.mjs'
+
+- id: agent-core
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    persona: !!js process.env.DSH_SYSTEM_PROMPT ?? ''
+    # The spine registers `bash`; visibility is narrowed per SDK session by
+    # the HarnessingTS allowlist plugin below.
+    toolBash: {}
+    workspaceContext:
+      maxBytes: 65536
+
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+
+- id: sessions
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
+
+- id: session-checkpoints
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'
+
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+
+- id: bash
+  name: '@deepseek-ai/dsh-bash-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+    timeoutMs: 300000
+
+- id: fs-local
+  name: '@deepseek-ai/dsh-fs-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+- id: fs-observation-policy
+  name: '@deepseek-ai/dsh-fs-observation-policy'
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: true
+
+# The upstream HTTP provider has no private-network/SSRF guard.  Keep network
+# access deployment-controlled; model schemas are absent unless explicitly
+# enabled in the server environment.
+- id: web
+  name: '@deepseek-ai/dsh-web'
+
+- id: web-fetch-http
+  name: '@deepseek-ai/dsh-web-fetch-http'
+
+- id: web-search-deepseek
+  name: '@deepseek-ai/dsh-web-search-deepseek'
+  config:
+    apiKeyEnv: DEEPSEEK_API_KEY
+
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    fetch: !!js process.env.TS_HARNESS_ENABLE_WEB_FETCH === 'true'
+    search: !!js process.env.TS_HARNESS_ENABLE_WEB_SEARCH === 'true' && Boolean(process.env.DEEPSEEK_API_KEY)
+
+- id: session-projection
+  name: '@deepseek-ai/dsh-session-projection'
+
+- id: subagent
+  name: '@deepseek-ai/dsh-subagent'
+
+- id: subagent-spawn-in-process
+  name: '@deepseek-ai/dsh-subagent-spawn-in-process'
+  config:
+    providerName: spawn
+
+- id: subagent-fork-in-process
+  name: '@deepseek-ai/dsh-subagent-fork-in-process'
+  config:
+    providerName: fork
+
+- id: tool-subagent-control
+  name: '@deepseek-ai/dsh-tool-subagent-control'
+
+- id: tool-subagent-report
+  name: '@deepseek-ai/dsh-tool-subagent-report'
+
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: subagent
+    backgroundMode: continuable
+    maxDepth: 1
+
+- id: tool-subagent-fork
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: fork
+    toolName: subagent_fork
+    backgroundMode: one-shot
+    enableRunInBackground: false
+    maxDepth: 1
+
+- id: harnessing-ts-tool-allowlist
+  name: '../../../dsh_runtime/tool-allowlist.mjs'
+
+- id: ts-harness-mcp
+  name: '../../../dsh_runtime/node_modules/@deepseek-ai/dsh-mcp-client/lib/index.js'
+  config:
+    serverName: ts_harness
+    transport: stdio
+    command: !!js process.env.TS_HARNESS_DSH_PYTHON
+    args: ['-m', 'harnessing_ts.mcp.server']
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+    env:
+      TS_HARNESS_WORKSPACE: !!js process.env.TS_HARNESS_WORKSPACE
+      TS_HARNESS_DSH_SESSION_ROLE: !!js process.env.TS_HARNESS_DSH_SESSION_ROLE
+      TS_HARNESS_DSH_NODE_SESSION_ID: !!js process.env.TS_HARNESS_DSH_NODE_SESSION_ID ?? ''
+      TS_HARNESS_DSH_ALLOWED_TOOLS: !!js process.env.TS_HARNESS_DSH_ALLOWED_TOOLS ?? ''
+      TS_HARNESS_VARIANT: !!js process.env.TS_HARNESS_VARIANT ?? ''
+      TS_HARNESS_CONTROL_MODE: !!js process.env.TS_HARNESS_CONTROL_MODE ?? 'auto'
+      TS_HARNESS_DRY_RUN: !!js process.env.TS_HARNESS_DRY_RUN ?? 'false'
+      TS_HARNESS_SKIP_WORKSPACE_UV: !!js process.env.TS_HARNESS_SKIP_WORKSPACE_UV ?? ''
+      # These values are deliberately DSH_* names. dsh-subprocess scrubs them
+      # from shell-tool children; this explicit MCP config is their only
+      # forwarding path into the bridge process.
+      DSH_MCP_CONTROL_URL: !!js process.env.DSH_MCP_CONTROL_URL ?? ''
+      DSH_MCP_CAPABILITY: !!js process.env.DSH_MCP_CAPABILITY ?? ''
+      PYTHONPATH: !!js process.env.PYTHONPATH ?? ''
+    failOnStartupError: true
+    toolCallTimeoutMs: 300000

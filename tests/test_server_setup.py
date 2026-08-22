@@ -22,6 +22,10 @@ def test_setup_server_combines_frontend_build_and_runtime_base(tmp_path, monkeyp
         "state": "ready",
         "root": str(tmp_path / ".runtime-base"),
     })
+    monkeypatch.setattr(server_setup, "_prepare_dsh_runtime", lambda root, reporter: {
+        "state": "ready",
+        "root": str(root),
+    })
     messages: list[str] = []
 
     result = server_setup.setup_server(reporter=messages.append)
@@ -32,6 +36,7 @@ def test_setup_server_combines_frontend_build_and_runtime_base(tmp_path, monkeyp
         ["/usr/bin/bun", "run", "build"],
     ]
     assert result["frontend"]["state"] == "ready"
+    assert result["dshRuntime"]["state"] == "ready"
     assert result["runtimeBase"]["state"] == "ready"
     assert any("automatically" in message and "TS_HARNESS_WORKSPACE" in message for message in messages)
 
@@ -49,6 +54,10 @@ def test_setup_server_fails_with_actionable_message_when_bun_is_missing(tmp_path
 
 def test_setup_server_supports_explicit_partial_setup(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(server_setup, "project_root", lambda: tmp_path)
+    monkeypatch.setattr(server_setup, "_prepare_dsh_runtime", lambda root, reporter: {
+        "state": "ready",
+        "root": str(root),
+    })
     result = server_setup.setup_server(skip_frontend=True, skip_runtime_base=True, reporter=None)
 
     assert result["state"] == "ready"

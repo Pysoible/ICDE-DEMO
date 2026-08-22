@@ -1,14 +1,27 @@
 from __future__ import annotations
 
-import json
+"""MCP bridge for DeepSeek Harness.
+
+DSH starts this module over stdio through its official MCP client
+plugin.  In the web server, stateful calls carry a capability back to the
+live server-owned orchestrator; direct CLI invocation keeps a local fallback.
+"""
+
+import asyncio
 import inspect
+import json
+import os
+from pathlib import Path
+import sys
 from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from harnessing_ts.schema import NODE_TYPES
 
 
-def text_result(value: Any) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}]}
+def text_result(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _require_intend(schema: dict[str, Any]) -> dict[str, Any]:
@@ -30,412 +43,266 @@ def _without_intend(args: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in args.items() if key != "intend"}
 
 
-def create_harness_mcp_server(
-    *,
-    session_role: str,
-    enter_node: Callable[[dict[str, Any]], Any] | None = None,
-    query_knowledge: Callable[[dict[str, Any]], Any] | None = None,
-    extract_reference_features: Callable[[dict[str, Any]], Any] | None = None,
-    inspect_reference_feature_extractor: Callable[[dict[str, Any]], Any] | None = None,
-    validate_reference_feature_extractor: Callable[[dict[str, Any]], Any] | None = None,
-    finish_node: Callable[[dict[str, Any]], Any] | None = None,
-    record_artifact: Callable[[dict[str, Any]], Any] | None = None,
-    record_run: Callable[[dict[str, Any]], Any] | None = None,
-    get_runtime_settings: Callable[[], Any] | None = None,
-    knowledge_base_tools: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
-) -> Any:
+def _workspace_path() -> Path:
+    value = os.getenv("TS_HARNESS_WORKSPACE")
+    if not value:
+        raise RuntimeError("TS_HARNESS_WORKSPACE is required for the DeepSeek Harness MCP bridge.")
+    return Path(value).resolve()
+
+
+def _orchestrator() -> Any:
+    """Compatibility fallback for direct CLI MCP use without the web server."""
+    from harnessing_ts.orchestrator import HarnessOrchestrator
+
+    orchestrator = HarnessOrchestrator(
+        _workspace_path(),
+        mode=os.getenv("TS_HARNESS_CONTROL_MODE") or None,
+        dry_run=os.getenv("TS_HARNESS_DRY_RUN", "").strip().lower() in {"1", "true", "yes"},
+    )
+    orchestrator.initialize()
+    return orchestrator
+
+
+def _control_url() -> str | None:
+    value = os.getenv("DSH_MCP_CONTROL_URL", "").strip()
+    return value.rstrip("/") if value else None
+
+
+def _control_capability() -> str | None:
+    value = os.getenv("DSH_MCP_CAPABILITY", "").strip()
+    return value or None
+
+
+async def _call_control(tool: str, args: dict[str, Any]) -> Any:
+    """Call the live server-owned orchestrator when DSH runs under the UI.
+
+    Direct CLI MCP invocation still has no parent service to call, so it keeps
+    the legacy local facade as a deliberately isolated compatibility path.
+    """
+    control_url = _control_url()
+    capability = _control_capability()
+    if not control_url or not capability:
+        return await _call_local_control(tool, args)
+    payload = {
+        "workspace": str(_workspace_path()),
+        "role": _role(),
+        "nodeSessionId": os.getenv("TS_HARNESS_DSH_NODE_SESSION_ID") or None,
+        "tool": tool,
+        "args": args,
+    }
+    return await asyncio.to_thread(_post_control, control_url, capability, payload)
+
+
+def _post_control(control_url: str, capability: str, payload: dict[str, Any]) -> Any:
+    request = Request(
+        f"{control_url}/internal/dsh/mcp",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-TS-Harness-Capability": capability,
+        },
+        method="POST",
+    )
     try:
-        from claude_code_sdk import create_sdk_mcp_server, tool
-    except Exception:
-        return None
-
-    tools: list[Any] = []
-
-    if session_role == "knowledge_builder" and knowledge_base_tools:
-        _add_knowledge_base_tools(tools, tool, knowledge_base_tools)
-
-    if session_role == "main" and enter_node:
-        @tool(
-            name="enter_node",
-            description="Request entry into a time-series tool-use harness node. The harness either auto-allows it or parks it for human approval according to TS_HARNESS_CONTROL_MODE.",
-            input_schema=_require_intend({
-                "type": "object",
-                "properties": {
-                    "nodeType": {"type": "string", "enum": list(NODE_TYPES)},
-                    "rationale": {"type": "string"},
-                    "inputSummary": {"type": "string"},
-                    "retryFailedNode": {
-                        "type": "boolean",
-                        "description": "Set true only when Current Workspace Progress recommends retry_failed_node and the latest user message explicitly asks to continue or retry that failed node.",
-                    },
-                },
-                "required": ["nodeType", "rationale"],
-            }),
-        )
-        async def _enter_node(args: dict[str, Any]) -> dict[str, Any]:
-            return text_result(await _maybe_await(enter_node(_without_intend(args))))
-
-        tools.append(_enter_node)
-
-    if (session_role == "main" or session_role == "node") and query_knowledge:
-        @tool(
-            name="query_knowledge",
-            description="Ask the independent knowledge reasoning agent a natural-language domain question. Use this instead of reading knowledge_base/tables files directly. Returns a concise answer by default; set includeEvidence=true only when citations or raw evidence details are needed.",
-            input_schema=_require_intend({
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string"},
-                    "domain": {"type": "string"},
-                    "context": {"type": "object"},
-                    "observations": {"type": "array", "items": {"type": "string"}},
-                    "includeEvidence": {"type": "boolean"},
-                },
-                "required": ["question"],
-            }),
-        )
-        async def _query_knowledge(args: dict[str, Any]) -> dict[str, Any]:
-            return text_result(await _maybe_await(query_knowledge(_without_intend(args))))
-
-        tools.append(_query_knowledge)
-
-    if (session_role == "main" or session_role == "node") and extract_reference_features:
-        @tool(
-            name="extract_reference_features",
-            description="Run the validated deterministic program built strictly from the current task definition and references. Pass one case in exactly the generated extractor's documented task-specific input format. This MCP path is a compatibility/smoke-test entrypoint; for large inputs, later nodes may import the validated Python API documented in manifest.json and README.md directly, as long as they record the call. Do not replace the deterministic extractor with visual or LLM-only judgment.",
-            input_schema=_require_intend({
-                "type": "object",
-                "properties": {
-                    "input": {
-                        "description": "One case encoded exactly as documented by the generated extractor inputSchema. Use inspect_reference_feature_extractor first when the format is unclear."
-                    },
-                },
-                "required": ["input"],
-            }),
-        )
-        async def _extract_reference_features(args: dict[str, Any]) -> dict[str, Any]:
-            return text_result(await _maybe_await(extract_reference_features(_without_intend(args))))
-
-        tools.append(_extract_reference_features)
-
-    if (session_role == "main" or session_role == "node") and inspect_reference_feature_extractor:
-        @tool(
-            name="inspect_reference_feature_extractor",
-            description="Read the complete generated deterministic extractor contract and implementation: manifest, Python API declaration, reference rules, README, and source code. Use this to learn the exact task-specific input/output rules, feature definitions, thresholds, limitations, and implementation details before calling the MCP extractor or importing the Python API directly.",
-            input_schema=_require_intend({"type": "object", "properties": {}}),
-        )
-        async def _inspect_reference_feature_extractor(args: dict[str, Any]) -> dict[str, Any]:
-            return text_result(await _maybe_await(inspect_reference_feature_extractor(_without_intend(args))))
-
-        tools.append(_inspect_reference_feature_extractor)
-
-    if (session_role == "main" or session_role == "node") and validate_reference_feature_extractor:
-        @tool(
-            name="validate_reference_feature_extractor",
-            description="Validate the on-disk reference feature extractor built during the knowledge-to-tools node. The backend checks required files, feature plan, evidence map, evaluation report, manifest schema, Python API importability, reference evidence, real-sample test cases, deterministic-source AST allowlist, and duplicate CLI/API execution tests. Returns a status object on success or raises an error message pointing at the failing artifact. After success, later nodes may use the documented Python API directly; extract_reference_features and inspect_reference_feature_extractor may also become available as compatibility MCP tools.",
-            input_schema=_require_intend({
-                "type": "object",
-                "properties": {
-                    "runTests": {
-                        "type": "boolean",
-                        "description": "Run duplicate-execution determinism tests in addition to manifest/evidence checks. Defaults to true.",
-                    },
-                },
-            }),
-        )
-        async def _validate_reference_feature_extractor(args: dict[str, Any]) -> dict[str, Any]:
-            return text_result(await _maybe_await(validate_reference_feature_extractor(_without_intend(args))))
-
-        tools.append(_validate_reference_feature_extractor)
-
-    if session_role == "node" and finish_node:
-        @tool(
-            name="finish_node",
-            description="Request completion of the active node. The harness either auto-allows it or parks it for human approval according to TS_HARNESS_CONTROL_MODE.",
-            input_schema=_require_intend({
-                "type": "object",
-                "properties": {
-                    "success": {"type": "boolean"},
-                    "summary": {"type": "string"},
-                    "goalMet": {"type": "boolean"},
-                    "nextNode": {
-                        "type": "string",
-                        "enum": [*list(NODE_TYPES), "none"],
-                        "description": "Structured node routing decision. For iterative-solving, this must agree with loopDecision: iterative-solving for continue, final-summary for exit.",
-                    },
-                    "loopDecision": {
-                        "type": "string",
-                        "enum": ["continue", "exit", "none"],
-                        "description": "Required for iterative-solving. Use continue for another iteration, exit for final-summary.",
-                    },
-                    "outputPaths": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["success", "summary"],
-            }),
-        )
-        async def _finish_node(args: dict[str, Any]) -> dict[str, Any]:
-            return text_result(await _maybe_await(finish_node(_without_intend(args))))
-
-        tools.append(_finish_node)
-
-    if session_role == "node" and record_artifact:
-        @tool(
-            name="record_artifact",
-            description="Record a produced artifact path in the harness timeline.",
-            input_schema=_require_intend({
-                "type": "object",
-                "properties": {"path": {"type": "string"}, "summary": {"type": "string"}},
-                "required": ["path"],
-            }),
-        )
-        async def _record_artifact(args: dict[str, Any]) -> dict[str, Any]:
-            return text_result(await _maybe_await(record_artifact(_without_intend(args))))
-
-        tools.append(_record_artifact)
-
-    if session_role == "node" and record_run:
-        @tool(
-            name="record_run",
-            description="Record a tool-guided solving run in runs/registry.jsonl.",
-            input_schema=_require_intend({
-                "type": "object",
-                "properties": {
-                    "runId": {"type": "string"},
-                    "status": {"type": "string", "enum": ["running", "completed", "failed"]},
-                    "startedAt": {"type": "string"},
-                    "finishedAt": {"type": "string"},
-                    "artifactPaths": {"type": "array", "items": {"type": "string"}},
-                    "summary": {"type": "string"},
-                    "metrics": {"type": "object"},
-                },
-                "required": ["runId", "status", "startedAt", "artifactPaths"],
-            }),
-        )
-        async def _record_run(args: dict[str, Any]) -> dict[str, Any]:
-            return text_result(await _maybe_await(record_run(_without_intend(args))))
-
-        tools.append(_record_run)
-
-    if session_role == "node" and get_runtime_settings:
-        @tool(
-            name="get_runtime_settings",
-            description="Read live harness runtime parameters. Iterative-solving must call this before proposing candidate solutions so UI changes to iterativeCandidateCount take effect.",
-            input_schema=_require_intend({
-                "type": "object",
-                "properties": {},
-            }),
-        )
-        async def _get_runtime_settings(args: dict[str, Any]) -> dict[str, Any]:
-            return text_result(await _maybe_await(get_runtime_settings()))
-
-        tools.append(_get_runtime_settings)
-
-    return create_sdk_mcp_server(name="ts_harness", version="0.1.0", tools=tools)
+        with urlopen(request, timeout=305) as response:  # nosec B310: loopback URL is capability-gated
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(body).get("detail") or body
+        except json.JSONDecodeError:
+            detail = body
+        raise RuntimeError(f"HarnessingTS control request failed ({exc.code}): {detail}") from None
+    except URLError as exc:
+        raise RuntimeError(f"HarnessingTS control endpoint is unavailable: {exc.reason}") from None
 
 
-def _add_knowledge_base_tools(tools: list[Any], tool: Any, callbacks: dict[str, Callable[[dict[str, Any]], Any]]) -> None:
-    def callback(name: str) -> Callable[[dict[str, Any]], Any]:
-        return callbacks[name]
-
-    @tool(
-        name="scan_references",
-        description="Scan workspace references, compute hashes, and return new/changed references plus compact unchanged reference briefs.",
-        input_schema=_require_intend({"type": "object", "properties": {"include_processed": {"type": "boolean"}}}),
-    )
-    async def _scan_references(args: dict[str, Any]) -> dict[str, Any]:
-        return text_result(await _maybe_await(callback("scan_references")(_without_intend(args))))
-
-    @tool(
-        name="extract_reference_text",
-        description="Extract deterministic text from a reference. For PDFs this uses pdftotext page-by-page and writes a cache under knowledge_base/cache/reference_text. Use this before SDK Read when building evidence quoted_fragments.",
-        input_schema=_require_intend({
-            "type": "object",
-            "properties": {
-                "reference_id": {"type": "string"},
-                "path": {"type": "string"},
-                "pages": {"type": "string", "description": "Optional page selection like 1,3-5."},
-                "max_chars_per_page": {"type": "integer"},
-            },
-        }),
-    )
-    async def _extract_reference_text(args: dict[str, Any]) -> dict[str, Any]:
-        return text_result(await _maybe_await(callback("extract_reference_text")(_without_intend(args))))
-
-    @tool(
-        name="update_reference_brief",
-        description="Update the compact title and brief for a processed reference.",
-        input_schema=_require_intend({
-            "type": "object",
-            "properties": {
-                "reference_id": {"type": "string"},
-                "title": {"type": "string"},
-                "brief": {"type": "string"},
-            },
-            "required": ["reference_id", "brief"],
-        }),
-    )
-    async def _update_reference_brief(args: dict[str, Any]) -> dict[str, Any]:
-        return text_result(await _maybe_await(callback("update_reference_brief")(_without_intend(args))))
-
-    @tool(
-        name="add_evidence",
-        description="Add an evidence record. The tool assigns E-xxxxx, normalizes reference_file, JSON-serializes quoted_fragments, and writes evidence.csv.",
-        input_schema=_require_intend({
-            "type": "object",
-            "properties": {
-                "reference_file": {"type": "string"},
-                "page": {"type": "string"},
-                "section": {"type": "string"},
-                "quoted_fragments": {"type": "array", "items": {"type": "string"}},
-                "notes": {"type": "string"},
-            },
-            "required": ["reference_file", "quoted_fragments"],
-        }),
-    )
-    async def _add_evidence(args: dict[str, Any]) -> dict[str, Any]:
-        return text_result(await _maybe_await(callback("add_evidence")(_without_intend(args))))
-
-    @tool(
-        name="add_knowledge",
-        description="Add a knowledge record supported by evidence. The tool assigns K-xxxxx and marks it pending_graph.",
-        input_schema=_require_intend({
-            "type": "object",
-            "properties": {
-                "topic": {"type": "string"},
-                "description": {"type": "string"},
-                "summary": {"type": "string"},
-                "evidence_ids": {"type": "array", "items": {"type": "string"}},
-                "notes": {"type": "string"},
-            },
-            "required": ["topic", "description", "evidence_ids"],
-        }),
-    )
-    async def _add_knowledge(args: dict[str, Any]) -> dict[str, Any]:
-        return text_result(await _maybe_await(callback("add_knowledge")(_without_intend(args))))
-
-    @tool(
-        name="list_pending_knowledge",
-        description="Return compact pending knowledge records that still need class/relation graph processing.",
-        input_schema=_require_intend({"type": "object", "properties": {"limit": {"type": "integer"}}}),
-    )
-    async def _list_pending_knowledge(args: dict[str, Any]) -> dict[str, Any]:
-        return text_result(await _maybe_await(callback("list_pending_knowledge")(_without_intend(args))))
-
-    @tool(
-        name="get_knowledge",
-        description="Read one knowledge record. Compact detail avoids long context; full includes description and notes.",
-        input_schema=_require_intend({
-            "type": "object",
-            "properties": {
-                "knowledge_id": {"type": "string"},
-                "detail": {"type": "string", "enum": ["compact", "full"]},
-            },
-            "required": ["knowledge_id"],
-        }),
-    )
-    async def _get_knowledge(args: dict[str, Any]) -> dict[str, Any]:
-        return text_result(await _maybe_await(callback("get_knowledge")(_without_intend(args))))
-
-    @tool(
-        name="search_classes",
-        description="Search existing classes by normalized label, aliases, and keywords before deciding whether to reuse or create a class.",
-        input_schema=_require_intend({
-            "type": "object",
-            "properties": {"query": {"type": "string"}, "top_k": {"type": "integer"}},
-            "required": ["query"],
-        }),
-    )
-    async def _search_classes(args: dict[str, Any]) -> dict[str, Any]:
-        return text_result(await _maybe_await(callback("search_classes")(_without_intend(args))))
-
-    @tool(
-        name="upsert_class",
-        description="Create or merge a class. The tool normalizes label, assigns/reuses C-xxxxx, merges evidence and source knowledge, and backfills knowledge.class_ids.",
-        input_schema=_require_intend({
-            "type": "object",
-            "properties": {
-                "label": {"type": "string"},
-                "concept_level": {"type": "integer"},
-                "concept_type": {"type": "string"},
-                "description_addition": {"type": "string"},
-                "aliases": {"type": "array", "items": {"type": "string"}},
-                "source_knowledge_ids": {"type": "array", "items": {"type": "string"}},
-                "evidence_ids": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["label", "concept_level", "concept_type", "description_addition", "source_knowledge_ids"],
-        }),
-    )
-    async def _upsert_class(args: dict[str, Any]) -> dict[str, Any]:
-        return text_result(await _maybe_await(callback("upsert_class")(_without_intend(args))))
-
-    @tool(
-        name="search_relations",
-        description="Search existing relations by source class, target class, and optional relation type before upserting.",
-        input_schema=_require_intend({
-            "type": "object",
-            "properties": {
-                "source_class_id": {"type": "string"},
-                "target_class_id": {"type": "string"},
-                "relation_type": {"type": "string"},
-            },
-        }),
-    )
-    async def _search_relations(args: dict[str, Any]) -> dict[str, Any]:
-        return text_result(await _maybe_await(callback("search_relations")(_without_intend(args))))
-
-    @tool(
-        name="upsert_relation",
-        description="Create or merge a relation. The tool validates class ids, normalizes relation_type, merges evidence/source knowledge, and backfills knowledge.relation_ids.",
-        input_schema=_require_intend({
-            "type": "object",
-            "properties": {
-                "source_class_id": {"type": "string"},
-                "relation_type": {"type": "string"},
-                "target_class_id": {"type": "string"},
-                "relation_depth": {"type": "integer"},
-                "description_addition": {"type": "string"},
-                "source_knowledge_ids": {"type": "array", "items": {"type": "string"}},
-                "evidence_ids": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["source_class_id", "relation_type", "target_class_id", "description_addition", "source_knowledge_ids"],
-        }),
-    )
-    async def _upsert_relation(args: dict[str, Any]) -> dict[str, Any]:
-        return text_result(await _maybe_await(callback("upsert_relation")(_without_intend(args))))
-
-    @tool(
-        name="validate_knowledge_base",
-        description="Validate CSV schema, references, IDs, graph endpoints, and evidence coverage. Returns errors and warnings without writing manifest.",
-        input_schema=_require_intend({"type": "object", "properties": {}}),
-    )
-    async def _validate_knowledge_base(args: dict[str, Any]) -> dict[str, Any]:
-        return text_result(await _maybe_await(callback("validate_knowledge_base")(_without_intend(args))))
-
-    @tool(
-        name="finalize_knowledge_base",
-        description="Finalize the knowledge base: inherit evidence, validate, write manifest, and update indexes.",
-        input_schema=_require_intend({"type": "object", "properties": {}}),
-    )
-    async def _finalize_knowledge_base(args: dict[str, Any]) -> dict[str, Any]:
-        return text_result(await _maybe_await(callback("finalize_knowledge_base")(_without_intend(args))))
-
-    tools.extend([
-        _scan_references,
-        _extract_reference_text,
-        _update_reference_brief,
-        _add_evidence,
-        _add_knowledge,
-        _list_pending_knowledge,
-        _get_knowledge,
-        _search_classes,
-        _upsert_class,
-        _search_relations,
-        _upsert_relation,
-        _validate_knowledge_base,
-        _finalize_knowledge_base,
-    ])
+async def _call_local_control(tool: str, args: dict[str, Any]) -> Any:
+    orchestrator = _orchestrator()
+    if tool == "enter_node":
+        return await orchestrator.request_enter_node(args)
+    if tool == "query_knowledge":
+        return await orchestrator.request_query_knowledge(args)
+    if tool == "extract_reference_features":
+        return orchestrator.request_extract_reference_features(args)
+    if tool == "inspect_reference_feature_extractor":
+        return orchestrator.request_inspect_reference_feature_extractor(args)
+    if tool == "validate_reference_feature_extractor":
+        return await orchestrator.request_validate_reference_feature_extractor(args)
+    if tool == "finish_node":
+        return await orchestrator.request_finish_node_for_node(args, _node_id())
+    if tool in {"record_artifact", "record_run"}:
+        node = orchestrator.store.read_node_session(_node_id())
+        if not node:
+            raise RuntimeError("Unknown active node session.")
+        if tool == "record_artifact":
+            return orchestrator.record_artifact_for_node(args, _node_id(), node["nodeType"])
+        return orchestrator.record_run_for_node(args, _node_id(), node["nodeType"])
+    if tool == "get_runtime_settings":
+        return orchestrator.get_runtime_settings()
+    raise RuntimeError(f"Unknown HarnessingTS MCP tool: {tool}")
 
 
-async def _maybe_await(value: Any) -> Any:
-    if inspect.isawaitable(value):
-        return await value
+def _allowed(tool_name: str) -> bool:
+    raw = os.getenv("TS_HARNESS_DSH_ALLOWED_TOOLS", "")
+    allowed = {item for item in raw.split(",") if item}
+    return f"mcp__ts_harness__{tool_name}" in allowed
+
+
+def _role() -> str:
+    return os.getenv("TS_HARNESS_DSH_SESSION_ROLE", "main")
+
+
+def _node_id() -> str:
+    value = os.getenv("TS_HARNESS_DSH_NODE_SESSION_ID", "")
+    if not value:
+        raise RuntimeError("Node MCP bridge calls require TS_HARNESS_DSH_NODE_SESSION_ID.")
     return value
+
+
+def create_dsh_mcp_server() -> Any:
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except Exception as exc:
+        raise RuntimeError(
+            "The 'mcp' package is required for the DeepSeek Harness MCP bridge "
+            f"(interpreter: {sys.executable})."
+        ) from exc
+
+    server = FastMCP("ts_harness")
+    role = _role()
+
+    if role == "knowledge_builder":
+        _register_knowledge_base_tools(server)
+        return server
+
+    if role == "main" and _allowed("enter_node"):
+        @server.tool(name="enter_node", description="Request entry into a time-series harness node.")
+        async def enter_node(nodeType: str, rationale: str, intend: str, inputSummary: str | None = None, retryFailedNode: bool | None = None) -> str:
+            if nodeType not in NODE_TYPES:
+                raise ValueError(f"Unknown node type: {nodeType}")
+            return text_result(await _call_control("enter_node", _without_intend({
+                "nodeType": nodeType, "rationale": rationale, "inputSummary": inputSummary, "retryFailedNode": retryFailedNode, "intend": intend,
+            })))
+
+    if role in {"main", "node"} and _allowed("query_knowledge"):
+        @server.tool(name="query_knowledge", description="Ask the configured independent knowledge reasoning agent a domain question.")
+        async def query_knowledge(question: str, intend: str, domain: str | None = None, context: dict[str, Any] | None = None, observations: list[str] | None = None, includeEvidence: bool = False) -> str:
+            return text_result(await _call_control("query_knowledge", _without_intend({
+                "question": question, "domain": domain, "context": context, "observations": observations, "includeEvidence": includeEvidence, "intend": intend,
+            })))
+
+    if role in {"main", "node"} and _allowed("extract_reference_features"):
+        @server.tool(name="extract_reference_features", description="Run the validated deterministic reference feature extractor.")
+        async def extract_reference_features(input: Any, intend: str) -> str:
+            return text_result(await _call_control("extract_reference_features", {"input": input}))
+
+    if role in {"main", "node"} and _allowed("inspect_reference_feature_extractor"):
+        @server.tool(name="inspect_reference_feature_extractor", description="Inspect the generated deterministic reference feature extractor.")
+        async def inspect_reference_feature_extractor(intend: str) -> str:
+            return text_result(await _call_control("inspect_reference_feature_extractor", {}))
+
+    if role in {"main", "node"} and _allowed("validate_reference_feature_extractor"):
+        @server.tool(name="validate_reference_feature_extractor", description="Validate the generated deterministic reference feature extractor.")
+        async def validate_reference_feature_extractor(intend: str, runTests: bool = True) -> str:
+            return text_result(await _call_control("validate_reference_feature_extractor", {"runTests": runTests}))
+
+    if role == "node" and _allowed("finish_node"):
+        @server.tool(name="finish_node", description="Request completion of the active harness node.")
+        async def finish_node(success: bool, summary: str, intend: str, goalMet: bool | None = None, nextNode: str | None = None, loopDecision: str | None = None, outputPaths: list[str] | None = None) -> str:
+            return text_result(await _call_control("finish_node", _without_intend({
+                "success": success, "summary": summary, "goalMet": goalMet, "nextNode": nextNode,
+                "loopDecision": loopDecision, "outputPaths": outputPaths or [], "intend": intend,
+            })))
+
+    if role == "node" and _allowed("record_artifact"):
+        @server.tool(name="record_artifact", description="Record a produced artifact path in the harness timeline.")
+        async def record_artifact(path: str, intend: str, summary: str | None = None) -> str:
+            return text_result(await _call_control("record_artifact", {"path": path, "summary": summary or ""}))
+
+    if role == "node" and _allowed("record_run"):
+        @server.tool(name="record_run", description="Record a tool-guided solving run.")
+        async def record_run(runId: str, status: str, startedAt: str, artifactPaths: list[str], intend: str, finishedAt: str | None = None, summary: str | None = None, metrics: dict[str, Any] | None = None) -> str:
+            return text_result(await _call_control("record_run", {
+                "runId": runId, "status": status, "startedAt": startedAt, "artifactPaths": artifactPaths,
+                "finishedAt": finishedAt, "summary": summary or "", "metrics": metrics or {},
+            }))
+
+    if role == "node" and _allowed("get_runtime_settings"):
+        @server.tool(name="get_runtime_settings", description="Read live HarnessingTS runtime parameters.")
+        async def get_runtime_settings(intend: str) -> str:
+            return text_result(await _call_control("get_runtime_settings", {}))
+
+    return server
+
+
+def _register_knowledge_base_tools(server: Any) -> None:
+    from harnessing_ts.knowledge_graph import build_knowledge_base_tool_callbacks
+
+    callbacks = build_knowledge_base_tool_callbacks(_workspace_path())
+
+    def callback(name: str, args: dict[str, Any]) -> str:
+        value = callbacks[name](_without_intend(args))
+        if inspect.isawaitable(value):
+            raise RuntimeError(f"Knowledge-base callback {name} must be synchronous in the stdio bridge.")
+        return text_result(value)
+
+    @server.tool(name="scan_references")
+    async def scan_references(intend: str, include_processed: bool = False) -> str:
+        return callback("scan_references", locals())
+
+    @server.tool(name="extract_reference_text")
+    async def extract_reference_text(intend: str, reference_id: str | None = None, path: str | None = None, pages: str | None = None, max_chars_per_page: int | None = None) -> str:
+        return callback("extract_reference_text", locals())
+
+    @server.tool(name="update_reference_brief")
+    async def update_reference_brief(reference_id: str, brief: str, intend: str, title: str | None = None) -> str:
+        return callback("update_reference_brief", locals())
+
+    @server.tool(name="add_evidence")
+    async def add_evidence(reference_file: str, quoted_fragments: list[str], intend: str, page: str | None = None, section: str | None = None, notes: str | None = None) -> str:
+        return callback("add_evidence", locals())
+
+    @server.tool(name="add_knowledge")
+    async def add_knowledge(topic: str, description: str, evidence_ids: list[str], intend: str, summary: str | None = None, notes: str | None = None) -> str:
+        return callback("add_knowledge", locals())
+
+    @server.tool(name="list_pending_knowledge")
+    async def list_pending_knowledge(intend: str, limit: int = 10) -> str:
+        return callback("list_pending_knowledge", locals())
+
+    @server.tool(name="get_knowledge")
+    async def get_knowledge(knowledge_id: str, intend: str, detail: str = "compact") -> str:
+        return callback("get_knowledge", locals())
+
+    @server.tool(name="search_classes")
+    async def search_classes(query: str, intend: str, top_k: int = 10) -> str:
+        return callback("search_classes", locals())
+
+    @server.tool(name="upsert_class")
+    async def upsert_class(label: str, concept_level: int, concept_type: str, description_addition: str, source_knowledge_ids: list[str], intend: str, aliases: list[str] | None = None, evidence_ids: list[str] | None = None) -> str:
+        return callback("upsert_class", locals())
+
+    @server.tool(name="search_relations")
+    async def search_relations(intend: str, source_class_id: str | None = None, target_class_id: str | None = None, relation_type: str | None = None) -> str:
+        return callback("search_relations", locals())
+
+    @server.tool(name="upsert_relation")
+    async def upsert_relation(source_class_id: str, relation_type: str, target_class_id: str, description_addition: str, source_knowledge_ids: list[str], intend: str, relation_depth: int | None = None, evidence_ids: list[str] | None = None) -> str:
+        return callback("upsert_relation", locals())
+
+    @server.tool(name="validate_knowledge_base")
+    async def validate_knowledge_base(intend: str) -> str:
+        return callback("validate_knowledge_base", locals())
+
+    @server.tool(name="finalize_knowledge_base")
+    async def finalize_knowledge_base(intend: str) -> str:
+        return callback("finalize_knowledge_base", locals())
+
+
+def main() -> None:
+    create_dsh_mcp_server().run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

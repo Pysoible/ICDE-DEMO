@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from harnessing_ts.agent.translate import collapse_tool_parts, filter_display_parts, sdk_message_to_part
+from harnessing_ts.agent.translate import (
+    collapse_tool_parts,
+    dsh_event_to_parts,
+    filter_display_parts,
+    project_dsh_tool_events,
+    sdk_message_to_part,
+)
 from harnessing_ts.state.jsonl import read_jsonl
 from harnessing_ts.state.message_log import MessageLog
 
@@ -93,6 +99,36 @@ def _user_tool_result_with_reasoning_jsonl() -> dict:
     }
 
 
+def _dsh_tool_call(*, name: str = "mcp__ts_harness__scan_references", arguments: str | None = None) -> dict:
+    return {
+        "type": "tool/call",
+        "seq": 101,
+        "data": {
+            "callId": "call_dsh_1",
+            "name": name,
+            "arguments": arguments or '{"intend":"扫描参考文献以发现新增资料","include_processed":true}',
+        },
+    }
+
+
+def _dsh_tool_result(*, failed: bool = False) -> dict:
+    return {
+        "type": "tool/result",
+        "seq": 102,
+        "data": {
+            "message": {
+                "source": {"kind": "tool", "callId": "call_dsh_1"},
+                "content": [{
+                    "type": "tool-result",
+                    "toolCallId": "call_dsh_1",
+                    "content": [{"type": "text", "text": "扫描完成" if not failed else "权限不足"}],
+                    "isError": failed,
+                }],
+            },
+        },
+    }
+
+
 def test_tool_use_and_result_collapse_to_one_tool_call_part() -> None:
     tool_call = sdk_message_to_part(_assistant_tool_message())
     tool_result = sdk_message_to_part(_user_tool_result_message())
@@ -167,6 +203,56 @@ def test_message_log_merges_tool_result_into_prior_tool_call(tmp_path) -> None:
     assert parts[0]["resultText"] == "# HarnessingTS"
 
 
+def test_dsh_tool_events_become_intent_bearing_correlated_tool_card() -> None:
+    tool_call = dsh_event_to_parts(_dsh_tool_call())[0]
+    tool_result = dsh_event_to_parts(_dsh_tool_result())[0]
+
+    collapsed = collapse_tool_parts([tool_call, tool_result])
+
+    assert len(collapsed) == 1
+    assert collapsed[0]["type"] == "tool_call"
+    assert collapsed[0]["name"] == "mcp__ts_harness__scan_references"
+    assert collapsed[0]["intend"] == "扫描参考文献以发现新增资料"
+    assert collapsed[0]["toolUseId"] == "call_dsh_1"
+    assert collapsed[0]["status"] == "completed"
+    assert collapsed[0]["resultText"] == "扫描完成"
+
+
+def test_dsh_native_tool_uses_description_as_intend() -> None:
+    tool_call = dsh_event_to_parts(_dsh_tool_call(
+        name="bash",
+        arguments='{"command":"ls -la","description":"列出工作区文件以了解现状"}',
+    ))[0]
+
+    assert tool_call["intend"] == "列出工作区文件以了解现状"
+    assert tool_call["input"]["command"] == "ls -la"
+
+
+def test_dsh_tool_failure_is_merged_into_the_original_card() -> None:
+    collapsed = collapse_tool_parts([
+        dsh_event_to_parts(_dsh_tool_call())[0],
+        dsh_event_to_parts(_dsh_tool_result(failed=True))[0],
+    ])
+
+    assert collapsed[0]["status"] == "failed"
+    assert collapsed[0]["resultText"] == "权限不足"
+
+
+def test_legacy_raw_dsh_events_are_projected_without_rewriting_audit_log() -> None:
+    raw_parts = [
+        {"id": "raw-call", "timestamp": "2026-01-01T00:00:00Z", "role": "system", "type": "raw", "text": "tool/call", "raw": _dsh_tool_call()},
+        {"id": "raw-result", "timestamp": "2026-01-01T00:00:01Z", "role": "system", "type": "raw", "text": "tool/result", "raw": _dsh_tool_result()},
+    ]
+
+    displayed = filter_display_parts(collapse_tool_parts(project_dsh_tool_events(raw_parts)))
+
+    assert len(displayed) == 1
+    assert displayed[0]["id"] == "raw-call"
+    assert displayed[0]["type"] == "tool_call"
+    assert displayed[0]["status"] == "completed"
+    assert displayed[0]["resultText"] == "扫描完成"
+
+
 def test_display_filter_hides_sdk_token_telemetry() -> None:
     useful_retry = {
         "role": "system",
@@ -196,4 +282,27 @@ def test_display_filter_hides_sdk_token_telemetry() -> None:
         {"role": "system", "type": "result", "text": "success", "raw": {"is_error": False}},
     ])
 
-    assert parts == [useful_retry, visible_text]
+    assert len(parts) == 2
+    assert parts[0]["type"] == "raw"
+    assert parts[0]["text"] == "api_retry"
+    assert "raw" not in parts[0]
+    assert parts[1] == visible_text
+
+
+def test_display_filter_drops_audit_payload_and_bounds_large_tool_output() -> None:
+    parts = filter_display_parts([{
+        "id": "tool-1",
+        "role": "assistant",
+        "type": "tool_call",
+        "name": "bash",
+        "input": {"command": "x" * 5000},
+        "intend": "检查工作区",
+        "resultText": "y" * 7000,
+        "raw": {"secret": "must remain audit-only"},
+        "resultRaw": {"large": "must remain audit-only"},
+    }])
+
+    assert "raw" not in parts[0]
+    assert "resultRaw" not in parts[0]
+    assert parts[0]["input"]["truncated"] is True
+    assert "已截断" in parts[0]["resultText"]

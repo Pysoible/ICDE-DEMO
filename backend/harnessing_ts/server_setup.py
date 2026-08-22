@@ -22,10 +22,11 @@ def setup_server(
     result: dict[str, Any] = {
         "state": "running",
         "projectRoot": str(root),
+        "dshRuntime": {"state": "pending"},
         "frontend": {"state": "skipped" if skip_frontend else "pending"},
         "runtimeBase": {"state": "skipped" if skip_runtime_base else "pending"},
     }
-    _report(reporter, "[1/3] Backend environment is synchronized by `uv run`.")
+    _report(reporter, "[1/4] Backend environment is synchronized by `uv run`.")
 
     if not skip_frontend:
         frontend_status = _prepare_frontend(frontend_root(), reporter)
@@ -34,17 +35,24 @@ def setup_server(
             result.update({"state": "failed", "message": frontend_status["message"]})
             return result
     else:
-        _report(reporter, "[2/3] Frontend setup skipped by request.")
+        _report(reporter, "[2/4] Frontend setup skipped by request.")
+
+    _report(reporter, "[3/4] Installing and validating the DeepSeek Harness runtime extensions.")
+    dsh_runtime_status = _prepare_dsh_runtime(root / "backend" / "dsh_runtime", reporter)
+    result["dshRuntime"] = dsh_runtime_status
+    if dsh_runtime_status["state"] != "ready":
+        result.update({"state": "failed", "message": dsh_runtime_status["message"]})
+        return result
 
     if not skip_runtime_base:
-        _report(reporter, "[3/3] Preparing the shared machine runtime base.")
+        _report(reporter, "[4/4] Preparing the shared machine runtime base.")
         runtime_status = prepare_runtime_base(python_version=python_version, reporter=reporter)
         result["runtimeBase"] = runtime_status
         if runtime_status.get("state") != "ready":
             result.update({"state": "failed", "message": runtime_status.get("message", "runtime base setup failed")})
             return result
     else:
-        _report(reporter, "[3/3] Runtime-base setup skipped by request.")
+        _report(reporter, "[4/4] Runtime-base setup skipped by request.")
 
     result.update({
         "state": "ready",
@@ -64,7 +72,7 @@ def _prepare_frontend(root: Path, reporter: Callable[[str], None] | None) -> dic
         }
     timeout = int(os.getenv("TS_HARNESS_FRONTEND_SETUP_TIMEOUT", "900"))
     commands = ([bun, "install", "--frozen-lockfile"], [bun, "run", "build"])
-    _report(reporter, "[2/3] Installing frontend dependencies and building frontend/dist.")
+    _report(reporter, "[2/4] Installing frontend dependencies and building frontend/dist.")
     for command in commands:
         try:
             completed = subprocess.run(command, cwd=root, text=True, timeout=timeout, check=False)
@@ -88,6 +96,62 @@ def _prepare_frontend(root: Path, reporter: Callable[[str], None] | None) -> dic
         "root": str(root),
         "dist": str(root / "dist"),
         "commands": [" ".join(command) for command in commands],
+    }
+
+
+def _prepare_dsh_runtime(root: Path, reporter: Callable[[str], None] | None) -> dict[str, Any]:
+    npm = shutil.which("npm")
+    if not npm:
+        return {
+            "state": "failed",
+            "message": "npm executable not found in PATH; install Node.js 20+ before running setup-server",
+            "root": str(root),
+        }
+    if not (root / "package.json").is_file() or not (root / "package-lock.json").is_file():
+        return {
+            "state": "failed",
+            "message": "DeepSeek Harness runtime package.json or package-lock.json is missing",
+            "root": str(root),
+        }
+    timeout = int(os.getenv("TS_HARNESS_DSH_RUNTIME_SETUP_TIMEOUT", "900"))
+    try:
+        completed = subprocess.run([npm, "ci"], cwd=root, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "state": "failed",
+            "message": f"DeepSeek Harness runtime setup could not run npm ci: {exc}",
+            "root": str(root),
+        }
+    if completed.returncode != 0:
+        return {
+            "state": "failed",
+            "message": "DeepSeek Harness runtime setup command failed: npm ci",
+            "command": "npm ci",
+            "returncode": completed.returncode,
+            "root": str(root),
+        }
+    required = (
+        root / "session-jsonrpc.mjs",
+        root / "node_modules" / "@deepseek-ai" / "dsh-sdk-jsonrpc-server" / "lib" / "index.js",
+        root / "node_modules" / "@deepseek-ai" / "dsh-sdk-jsonrpc-demo" / "lib" / "bin.js",
+        root / "node_modules" / "@deepseek-ai" / "dsh-mcp-client" / "lib" / "index.js",
+        root / "node_modules" / "@deepseek-ai" / "dsh-tool-subagent" / "lib" / "index.js",
+        root / "node_modules" / "@deepseek-ai" / "dsh-web" / "lib" / "index.js",
+        root / "node_modules" / "@deepseek-ai" / "dsh-tool-web" / "lib" / "index.js",
+    )
+    missing = [str(path.relative_to(root)) for path in required if not path.is_file()]
+    if missing:
+        return {
+            "state": "failed",
+            "message": f"DeepSeek Harness runtime is incomplete after npm ci: {', '.join(missing)}",
+            "root": str(root),
+        }
+    _report(reporter, "DeepSeek Harness runtime extensions are ready.")
+    return {
+        "state": "ready",
+        "message": "DeepSeek Harness Node runtime dependencies installed and validated",
+        "root": str(root),
+        "command": "npm ci",
     }
 
 

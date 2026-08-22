@@ -19,9 +19,9 @@ from harnessing_ts.state.message_log import MessageLog
 from harnessing_ts.state.workspace_store import WorkspaceStore, now_iso
 
 
-CHAIN_READ_TOOLS = ["Read", "LS", "Glob", "Grep"]
-CHAIN_GENERATE_TOOLS = [*CHAIN_READ_TOOLS, "Write"]
-CHAIN_REPAIR_TOOLS = ["Read", "Edit"]
+CHAIN_READ_TOOLS = ["bash"]
+CHAIN_GENERATE_TOOLS = ["bash"]
+CHAIN_REPAIR_TOOLS = ["bash"]
 CHAIN_DRAFT_PATH = "artifacts/chain-summary.draft.json"
 CHAIN_MAX_REPAIR_ATTEMPTS = 6
 
@@ -46,8 +46,9 @@ async def build_chain_summary(
         attachment_text=None,
         allowed_tools=CHAIN_GENERATE_TOOLS,
         model=sdk_config.model,
+        provider=sdk_config.provider,
+        max_tokens=sdk_config.max_tokens,
         env=sdk_config.env,
-        extra_args=sdk_config.extra_args,
         log=MessageLog(store.chain_summary_log_path),
         on_part=on_part,
     ))
@@ -81,8 +82,9 @@ async def build_chain_summary(
                         attachment_text=None,
                         allowed_tools=CHAIN_REPAIR_TOOLS,
                         model=sdk_config.model,
+                        provider=sdk_config.provider,
+                        max_tokens=sdk_config.max_tokens,
                         env=sdk_config.env,
-                        extra_args=sdk_config.extra_args,
                         log=MessageLog(store.chain_summary_log_path),
                         on_part=on_part,
                     ))

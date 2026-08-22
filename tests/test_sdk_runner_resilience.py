@@ -4,69 +4,55 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from harnessing_ts.agent.sdk_runner import SdkRunner, SdkRunnerConfig
+from harnessing_ts.settings.llm import LlmConfig, build_sdk_invocation_config
 from harnessing_ts.state.jsonl import read_jsonl
 from harnessing_ts.state.message_log import MessageLog
 
 
-def _make_runner(tmp_path, extra_args=None) -> SdkRunner:
-    log = MessageLog(tmp_path / "main.jsonl")
-    cfg = SdkRunnerConfig(
+
+
+@pytest.fixture(autouse=True)
+def _run_sdk_calls_inline(monkeypatch):
+    async def inline(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", inline)
+
+
+def _make_runner(tmp_path) -> SdkRunner:
+    return SdkRunner(SdkRunnerConfig(
         cwd=tmp_path,
         system_prompt="test",
         allowed_tools=[],
-        log=log,
-        extra_args=extra_args,
-    )
-    return SdkRunner(cfg)
+        log=MessageLog(tmp_path / "main.jsonl"),
+    ))
 
 
-def test_extra_args_for_1m_context_window_have_no_leading_dashes(tmp_path) -> None:
-    """Regression test: the SDK's subprocess_cli transport prepends its own
-    '--' to every extra_args key. If the harness passes '--betas' the CLI
-    receives '----betas', rejects the unknown option on startup, and the
-    SDK then hangs for 60s before raising 'Control request timeout:
-    initialize'. Keys must NOT have leading dashes."""
-    from harnessing_ts.settings.llm import build_sdk_invocation_config
-    from harnessing_ts.settings.llm import LlmConfig
-
-    cfg = LlmConfig(
+def test_manual_deepseek_config_uses_deepseek_environment() -> None:
+    sdk = build_sdk_invocation_config(LlmConfig(
         authMode="manual",
-        model="m",
-        apiKey="k",
-        baseUrl=None,
-        protocol="anthropic",
-        contextWindow="1m",
-    )
-    sdk = build_sdk_invocation_config(cfg)
-    assert sdk.extra_args is not None
-    for flag in sdk.extra_args.keys():
-        assert not flag.startswith("-"), (
-            f"extra_args key {flag!r} starts with '-'; the SDK transport "
-            f"prepends its own '--', so the CLI would see '----{flag.lstrip('-')}'. "
-            f"Pass the flag name without leading dashes."
-        )
-    assert "betas" in sdk.extra_args
-    assert sdk.extra_args["betas"] == "context-1m-2025-08-07"
+        protocol="deepseek",
+        model="deepseek-v4-flash",
+        apiKey="secret",
+        baseUrl="https://api.deepseek.example",
+    ))
+
+    assert sdk.model == "deepseek-v4-flash"
+    assert sdk.provider == "deepseek-official"
+    assert sdk.env == {
+        "DEEPSEEK_API_KEY": "secret",
+        "DEEPSEEK_BASE_URL": "https://api.deepseek.example",
+    }
 
 
-def test_extra_args_for_200k_context_window_is_empty(tmp_path) -> None:
-    from harnessing_ts.settings.llm import build_sdk_invocation_config
-    from harnessing_ts.settings.llm import LlmConfig
-
-    cfg = LlmConfig(
-        authMode="manual",
-        model="m",
-        apiKey="k",
-        baseUrl=None,
-        protocol="anthropic",
-        contextWindow="200k",
-    )
-    sdk = build_sdk_invocation_config(cfg)
-    assert sdk.extra_args in (None, {})
+def test_manual_deepseek_config_requires_key() -> None:
+    with pytest.raises(RuntimeError, match="requires apiKey"):
+        build_sdk_invocation_config(LlmConfig(authMode="manual", model="deepseek-v4-flash"))
 
 
-def test_send_with_user_echo_injects_fresh_context_without_polluting_user_log(tmp_path) -> None:
+def test_send_with_user_echo_does_not_log_before_dsh_acceptance(tmp_path) -> None:
     runner = _make_runner(tmp_path)
     runner.send = AsyncMock(return_value=[])
 
@@ -79,94 +65,178 @@ def test_send_with_user_echo_injects_fresh_context_without_polluting_user_log(tm
         '{"recommendedAction":"enter_node"}\n\n## Current User Message\ncontinue the task'
     )
     assert parts[0]["text"] == "continue the task"
-    assert read_jsonl(runner.config.log.path)[0]["text"] == "continue the task"
+    assert read_jsonl(runner.config.log.path) == []
 
 
-def test_runner_resets_client_on_connect_failure(tmp_path) -> None:
-    """When ClaudeSDKClient.connect() raises (e.g. CLI crashed on startup),
-    the runner must drop the cached client so the next send() spawns a
-    fresh CLI subprocess instead of reusing the dead one."""
-    runner = _make_runner(tmp_path)
-
-    fake_client = AsyncMock()
-    fake_client.connect.side_effect = RuntimeError("simulated CLI crash")
-    # MagicMock (not AsyncMock) so calling the class is a sync function
-    # returning the awaitable fake client.
-    fake_client_class = MagicMock(return_value=fake_client)
-
-    with patch.dict("sys.modules", {"claude_code_sdk": SimpleNamespace(
-        ClaudeSDKClient=fake_client_class,
-        ClaudeCodeOptions=lambda **k: SimpleNamespace(**k),
-    )}):
-        with patch("harnessing_ts.agent.sdk_runner.build_disallowed_tools", return_value=[]):
-            raised = False
-            try:
-                asyncio.run(runner.send("hello"))
-            except RuntimeError:
-                raised = True
-            assert raised, "send() should propagate the connect() error"
-    assert runner._client is None, (
-        "Runner should have cleared the dead client so the next send() "
-        "spawns a fresh one instead of reusing it"
+def _dsh_module(harness: MagicMock) -> SimpleNamespace:
+    harness.client.request.side_effect = lambda method, params, **_kwargs: (
+        SimpleNamespace(
+            sessionId=params["sessionId"],
+            source="resumed" if params.get("mode") in {"resume", "recover"} else "created",
+            lastSeq=-1,
+        )
+        if method == "session/open"
+        else SimpleNamespace(sessionId=params["sessionId"], checkpointSeq=3, turnEnd=None)
+    )
+    return SimpleNamespace(
+        DeepSeekHarness=MagicMock(return_value=harness),
+        DeepSeekHarnessConfig=lambda **kwargs: SimpleNamespace(**kwargs),
     )
 
 
-def test_runner_resets_client_on_receive_loop_error(tmp_path) -> None:
-    """If the receive_response() loop raises (e.g. SDK raises 'Control
-    request timeout: initialize' because the CLI died mid-stream), the
-    runner must clear the cached client."""
+def test_runner_closes_and_resets_runtime_on_turn_error(tmp_path) -> None:
     runner = _make_runner(tmp_path)
+    harness = MagicMock()
+    harness.run.side_effect = RuntimeError("simulated runtime crash")
 
-    fake_client = AsyncMock()
-    fake_client.connect = AsyncMock()
-    fake_client.query = AsyncMock()
-    fake_client.receive_response = AsyncMock(
-        side_effect=Exception("Control request timeout: initialize")
-    )
-
-    fake_client_class = MagicMock(return_value=fake_client)
-
-    with patch.dict("sys.modules", {"claude_code_sdk": SimpleNamespace(
-        ClaudeSDKClient=fake_client_class,
-        ClaudeCodeOptions=lambda **k: SimpleNamespace(**k),
-    )}):
-        with patch("harnessing_ts.agent.sdk_runner.build_disallowed_tools", return_value=[]):
-            raised = False
-            try:
-                asyncio.run(runner.send("hello"))
-            except Exception:
-                raised = True
-            assert raised
-    assert runner._client is None, (
-        "Runner should drop the client when the receive loop dies; "
-        "otherwise the next send() reuses the dead client and hangs "
-        "another 60s on the same initialize timeout"
-    )
-
-
-def test_runner_keeps_client_on_normal_completion(tmp_path) -> None:
-    """Sanity check: a successful send() must NOT clear the client. The
-    next send() should reuse it (preserves conversation context)."""
-    runner = _make_runner(tmp_path)
-
-    fake_message = SimpleNamespace(session_id="sess-1")
-    async def _yield_one():
-        yield fake_message
-    fake_message_iter = _yield_one()
-
-    fake_client = AsyncMock()
-    fake_client.connect = AsyncMock()
-    fake_client.query = AsyncMock()
-    fake_client.receive_response = lambda: fake_message_iter
-    fake_client_class = MagicMock(return_value=fake_client)
-
-    with patch.dict("sys.modules", {"claude_code_sdk": SimpleNamespace(
-        ClaudeSDKClient=fake_client_class,
-        ClaudeCodeOptions=lambda **k: SimpleNamespace(**k),
-    )}):
-        with patch("harnessing_ts.agent.sdk_runner.build_disallowed_tools", return_value=[]):
+    with patch.dict("sys.modules", {"deepseek_harness": _dsh_module(harness)}):
+        with pytest.raises(RuntimeError, match="runtime crash"):
             asyncio.run(runner.send("hello"))
-    assert runner._client is fake_client, (
-        "Successful send() should keep the client so subsequent sends "
-        "reuse the same SDK session"
-    )
+
+    harness.close.assert_called_once()
+    assert runner._harness is None
+
+
+def test_runner_closes_runtime_when_checkpoint_fails(tmp_path) -> None:
+    runner = _make_runner(tmp_path)
+    harness = MagicMock()
+    harness.run.return_value = SimpleNamespace(events=[])
+
+    def request(method, params, **_kwargs):
+        if method == "session/open":
+            return SimpleNamespace(sessionId=params["sessionId"], source="created", lastSeq=-1)
+        raise RuntimeError("checkpoint transport failed")
+
+    harness.client.request.side_effect = request
+    with patch.dict("sys.modules", {"deepseek_harness": _dsh_module(harness)}):
+        harness.client.request.side_effect = request
+        with pytest.raises(RuntimeError, match="checkpoint transport failed"):
+            asyncio.run(runner.send("hello"))
+
+    harness.close.assert_called_once()
+    assert runner._harness is None
+
+
+def test_session_identity_and_user_echo_commit_only_after_dsh_acceptance(tmp_path) -> None:
+    committed: list[str] = []
+    runner = SdkRunner(SdkRunnerConfig(
+        cwd=tmp_path,
+        system_prompt="test",
+        allowed_tools=[],
+        log=MessageLog(tmp_path / "main.jsonl"),
+        on_session_id=committed.append,
+    ))
+    assert committed == []
+    harness = MagicMock()
+
+    def run(_content, *, session_id, on_notification):
+        on_notification(SimpleNamespace(
+            method="session.event",
+            payload={
+                "sessionId": session_id,
+                "event": {"type": "agent/inbox/spliced", "seq": 0, "data": {"inserted": []}},
+            },
+        ))
+        return SimpleNamespace(events=[])
+
+    harness.run.side_effect = run
+    with patch.dict("sys.modules", {"deepseek_harness": _dsh_module(harness)}):
+        parts = asyncio.run(runner.send_with_user_echo("accepted"))
+
+    assert committed == [runner.session_id]
+    assert parts[0]["text"] == "accepted"
+    assert read_jsonl(runner.config.log.path)[0]["text"] == "accepted"
+
+
+def test_runner_reopens_same_session_in_a_fresh_runtime_each_turn(tmp_path) -> None:
+    runner = _make_runner(tmp_path)
+    harness = MagicMock()
+    harness.run.return_value = SimpleNamespace(events=[])
+
+    with patch.dict("sys.modules", {"deepseek_harness": _dsh_module(harness)}):
+        asyncio.run(runner.send("hello"))
+        asyncio.run(runner.send("again"))
+
+    assert harness.run.call_count == 2
+    assert harness.close.call_count == 2
+    assert runner._harness is None
+    assert runner.session_id is not None
+    modes = [
+        call.args[1]["mode"]
+        for call in harness.client.request.call_args_list
+        if call.args[0] == "session/open"
+    ]
+    assert modes == ["create", "resume"]
+
+
+def test_runner_streams_notifications_before_turn_completion_without_duplicates(tmp_path) -> None:
+    emitted = []
+    runner = SdkRunner(SdkRunnerConfig(
+        cwd=tmp_path,
+        system_prompt="test",
+        allowed_tools=[],
+        log=MessageLog(tmp_path / "main.jsonl"),
+        on_part=emitted.append,
+    ))
+    harness = MagicMock()
+    assistant_event = {
+        "type": "assistant/message",
+        "seq": 1,
+        "data": {"message": {"content": [{"type": "text", "text": "正在处理"}]}},
+    }
+    tool_event = {
+        "type": "tool/call",
+        "seq": 2,
+        "data": {
+            "callId": "call_1",
+            "name": "mcp__ts_harness__scan_references",
+            "arguments": '{"intend":"扫描参考文献"}',
+        },
+    }
+    tool_result_event = {
+        "type": "tool/result",
+        "seq": 3,
+        "data": {
+            "message": {
+                "source": {"kind": "tool", "callId": "call_1"},
+                "content": [{
+                    "type": "tool-result",
+                    "toolCallId": "call_1",
+                    "content": [{"type": "text", "text": "扫描完成"}],
+                    "isError": False,
+                }],
+            },
+        },
+    }
+
+    def run(_content, *, session_id, on_notification):
+        on_notification(SimpleNamespace(
+            method="session.event",
+            payload={"sessionId": session_id, "event": assistant_event},
+        ))
+        on_notification(SimpleNamespace(
+            method="session.event",
+            payload={"sessionId": session_id, "event": tool_event},
+        ))
+        on_notification(SimpleNamespace(
+            method="session.event",
+            payload={"sessionId": session_id, "event": tool_result_event},
+        ))
+        return SimpleNamespace(events=[assistant_event, tool_event, tool_result_event])
+
+    harness.run.side_effect = run
+
+    with patch.dict("sys.modules", {"deepseek_harness": _dsh_module(harness)}):
+        parts = asyncio.run(runner.send("hello"))
+
+    assert [part["type"] for part in parts] == ["text", "tool_call"]
+    assert parts[1]["intend"] == "扫描参考文献"
+    assert parts[1]["status"] == "completed"
+    assert [part["type"] for part in emitted] == ["text", "tool_call", "tool_call"]
+    assert emitted[1]["status"] == "pending"
+    assert emitted[2]["id"] == emitted[1]["id"]
+    assert emitted[2]["status"] == "completed"
+    persisted = read_jsonl(runner.config.log.path)
+    assert [part["type"] for part in persisted] == ["text", "tool_call"]
+    assert persisted[1]["resultText"] == "扫描完成"
+    assert harness.run.call_args.kwargs["on_notification"]

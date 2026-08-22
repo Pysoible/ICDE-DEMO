@@ -7,7 +7,7 @@
 必须完成：
 - 用户输入主要用于明确任务目标、数据来源要求、输出期望和约束条件。不要把用户输入当作领域知识来源；领域知识主要来自 references/**。
 - references/** 可能包含学术论文、指南、说明文档或用户整理材料，格式可能是 PDF、DOCX、TXT、MD 或其他文本文件。必须构建或调用规范读取工具来读取这些资料：
-  - PDF：直接使用 Claude Code SDK 原生 `Read` 工具读取；不要优先构建额外 PDF 抽取/OCR 工具，除非 `Read` 明确无法读取或内容明显缺失。
+  - PDF：优先使用 DeepSeek Harness 的本地工具读取或提取文本；不要优先构建额外 PDF 抽取/OCR 工具，除非已有读取方式明确失败或内容明显缺失。
   - DOCX：优先读取系统生成的同名 `.docx.txt`；若不存在，使用 `uv run python tools/read_docx.py <docx> <output.txt>` 抽取。
   - TXT/MD：可直接读取，但需要将关键领域知识整理到结构化摘要中。
   - 对每个 reference 记录读取方式、抽取产物路径、覆盖范围和抽取失败/缺失风险。

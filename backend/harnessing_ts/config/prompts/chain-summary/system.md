@@ -22,5 +22,5 @@
 ## 输出协议
 
 - 必须生成符合下方 Schema 的合法 JSON，不使用 Markdown fence。
-- 必须使用内置 `Write` 工具把完整 JSON 写入 `artifacts/chain-summary.draft.json`。
+- 必须使用 DSH `bash` 工具把完整 JSON 写入 `artifacts/chain-summary.draft.json`。
 - 写入完成后只回复一句简体中文确认，不要在回复中重复 JSON。

@@ -6,9 +6,9 @@ The system is not a research agent. It does not center on comparing methods, fin
 
 ## Core Principles
 
-- Bind to Claude Code SDK as the execution runtime.
+- Bind to DeepSeek Harness as the execution runtime.
 - Keep local files and JSONL logs as the source of truth.
-- Treat SDK sessions as short-lived execution carriers.
+- Treat replaceable SDK runtime processes as execution carriers, while DSH persistence and workspace state remain durable.
 - Express methodology in Markdown prompts and node specs under `backend/harnessing_ts/config/`.
 - Use MCP tools for all structured node state transitions and audit events.
 - Make the solution a tool-use process, not a model-selection report.
@@ -23,9 +23,11 @@ The current implementation keeps runtime orchestration, domain routing rules, fi
 - `backend/harnessing_ts/api/realtime.py`: SSE fan-out for session parts, builder state, runtime state, and workspace file changes. The browser uses the SSE bootstrap snapshot and does not poll `/api/live`.
 - `backend/harnessing_ts/orchestrator.py`: application facade that coordinates workspace state, main/node sessions, pending control, knowledge operations, and runner lifecycle.
 - `backend/harnessing_ts/node_state.py`: node-chain routing and validation, including `loopDecision`, `nextNode`, pipeline completion, and iterative-solving output requirements.
-- `backend/harnessing_ts/agent/sdk_runner.py`: Claude Code SDK wrapper for message send/receive, tool-call/result merging, session id capture, interrupt/close, and client recovery after SDK failures.
-- `backend/harnessing_ts/agent/session_factory.py`: SDK runner construction for main and node sessions, including prompt assembly, allowed tools, MCP server wiring, and LLM invocation settings.
-- `backend/harnessing_ts/mcp/server.py`: MCP schemas and callback binding for governance, audit, runtime settings, knowledge query, and deterministic knowledge-base tools.
+- `backend/harnessing_ts/agent/sdk_runner.py`: DeepSeek Harness wrapper for JSON-RPC turn execution, session id capture, interrupt/close, and runtime recovery.
+- `backend/harnessing_ts/agent/session_factory.py`: SDK runner construction for main and node sessions, including prompt assembly, allowed tools, DSH MCP bridge wiring, and LLM invocation settings.
+- `backend/harnessing_ts/mcp/server.py`: stdio MCP bridge and callback binding for governance, audit, runtime settings, knowledge query, and deterministic knowledge-base tools.
+- `backend/harnessing_ts/config/deepseek-harness/cordis.yml`: the project composition for the DSH JSON-RPC server, persistence, local filesystem/shell, opt-in Web providers, subagents, tool allowlist, and MCP client.
+- `backend/dsh_runtime/`: package-locked Node runtime dependencies and the role/variant-aware DSH tool allowlist plugin. `setup-server` runs `npm ci` and verifies the required runtime entrypoints.
 - `backend/harnessing_ts/state/workspace_store.py`: repository facade for workspace JSON/JSONL state, logs, file reads, uploads, resets, runtime settings, and run/artifact records.
 - `backend/harnessing_ts/state/workspace_layout.py`: runtime workspace directory layout, built-in `tools/read_docx.py`, and DOCX reference text derivatives.
 - `backend/harnessing_ts/knowledge_graph.py`: file-backed knowledge-base tables, deterministic tools, graph view/search/cards, and builder/reasoner execution.
@@ -34,6 +36,26 @@ The current implementation keeps runtime orchestration, domain routing rules, fi
 - `frontend/src/main.ts`: static UI rendering and event binding.
 - `frontend/src/api.ts`: frontend HTTP helpers and error-message normalization.
 - `frontend/src/types.ts`: shared frontend DTO types.
+
+## DSH Runtime, Persistence, And Recovery
+
+`SdkRunner` constructs `DeepSeekHarness` with the repository-local `backend/dsh_runtime` as both `runtime_cwd` and the JSON-RPC runtime entrypoint, and with the workspace `.dsh-sessions/` directory as `session_root`. The Python SDK supplies the client API; `setup-server` must install the project-local Node composition before a live server can start a DSH turn.
+
+Each logical actor has one stable DSH session ID. A runtime process is ephemeral: `session/open` explicitly creates or resumes that ID, executes one prompt, acknowledges `session/checkpoint`, and shuts down. The identity is committed to actor state only after DSH accepts `session/open`; `state/execution.json` retains the reserved identity across a process crash. Recovery uses a resume-first `session/open(mode=recover)`: it creates the same reserved identity only for DSH's exact `session "…" not found` result, and never converts corruption or I/O failures into a new session. The DSH append-only log is the conversation/tool source of truth; the application transcript is only its display projection, and a user message is persisted there only after DSH emits its inbox receipt.
+
+### Pause and restart safety
+
+Normal pause is `agent.cancel({kind:'user'}) → agent.whenIdle() → drainContinuableDescendants() → sessions.flush()`. Only then does the execution state become `paused` and the runtime shut down. The `session/pause` acknowledgement's `checkpointSeq` is copied into `state/execution.json` and the `execution_paused` timeline event, so application state records the same durable boundary as DSH. A per-runner settlement lock serializes normal checkpoint and pause, while expected-runtime close semantics prevent an old turn from closing a newer recovery process. There is no automatic force timeout. A confirmed force-stop is limited to `pausing`; it kills the owned process group, waits for the old pause task to retire, then resumes the same identity and lets DSH persistence repair an incomplete tool boundary.
+
+Every bridged MCP call is fenced by actor, epoch, and lease. `pausing` rejects new calls, while already accepted work remains under DSH cancellation/checkpoint ordering. Async knowledge results revalidate the lease after their await and before audit publication, so a late response cannot mutate a paused or later turn.
+
+`/api/send` accepts prompts only in `ready` or `paused`. Resuming a paused node preserves its node and DSH session identities, starts a new execution epoch, and removes the node's active `pausedAt` marker; historical pause timing remains in `logs/timeline.jsonl`. Pause completion and failure both publish an SSE snapshot; the browser waits for `paused` or `failed` without imposing a force timeout.
+
+## DSH MCP Security Boundary
+
+`dsh-mcp-client` starts `harnessing_ts.mcp.server` over stdio. In a web-server run, the bridge forwards stateful calls to the live orchestrator through `/internal/dsh/mcp`, which accepts loopback clients only. Each runner receives a newly generated capability bound to its resolved workspace, role, node session, and allowed `mcp__ts_harness__*` tools; the capability is revoked when the runner closes.
+
+The control URL and capability use the reserved `DSH_MCP_CONTROL_URL` and `DSH_MCP_CAPABILITY` variables. DSH subprocesses scrub `DSH_*` values before model-executed shell commands run. The Cordis MCP configuration explicitly forwards those variables to the bridge process, which is the only intended child recipient. They are not public server settings and must never be surfaced to model prompts, browser payloads, logs, or reverse proxies.
 
 ## Node Chain
 
@@ -44,7 +66,7 @@ problem-contract
 → final-summary
 ```
 
-The main session acts as orchestrator. Each node is a Claude Code SDK session with its own prompt, tool whitelist, log, and completion summary. The `NOD-KGR-KTL-CRV-SUB-ADA` baseline uses the full four-node chain. Variants can disable specific capabilities; for example profiles without `KTL` skip `knowledge-to-tools`, so their chain becomes `problem-contract → iterative-solving → final-summary`.
+The main session acts as orchestrator. Each node is a DeepSeek Harness session with its own prompt, tool whitelist, log, and completion summary. The `NOD-KGR-KTL-CRV-SUB-ADA` baseline uses the full four-node chain. Variants can disable specific capabilities; for example profiles without `KTL` skip `knowledge-to-tools`, so their chain becomes `problem-contract → iterative-solving → final-summary`.
 
 ## Node Roles
 
@@ -106,7 +128,7 @@ The frontend is intentionally thin: it renders the same JSONL logs, node metadat
 
 ## Realtime UI Updates
 
-The backend exposes `/api/events` as a Server-Sent Events stream. `SdkRunner.on_part` publishes deduplicated persisted transcripts for main, node, knowledge-graph-builder, and chain-summary-builder sessions. Upload operations publish the refreshed workspace file tree, and task lifecycle events publish runtime snapshots. The stream's bootstrap event provides initial and reconnect state; the frontend does not poll snapshot endpoints. Messages use keyed DOM reconciliation, and other high-cost panels use content signatures so unchanged UI nodes are retained.
+The backend exposes `/api/events` as a Server-Sent Events stream. While a DSH turn is running, `SdkRunner` turns each root-session notification into one durable, deduplicated transcript part and publishes that part incrementally for main, node, knowledge-graph-builder, and chain-summary-builder sessions. Upload operations publish the refreshed workspace file tree, and task lifecycle events publish runtime snapshots. The stream's bootstrap event provides the complete persisted state for an initial connection or reconnect; the frontend does not poll snapshot endpoints. Messages use keyed DOM reconciliation, and other high-cost panels use content signatures so unchanged UI nodes are retained.
 
 ## Chain Summary
 
@@ -116,22 +138,11 @@ The JSON output contains metric series over iterations and iteration-level decis
 
 ## Tool Message Protocol
 
-Every agent tool call should include an `intend` argument: one short sentence describing the immediate reason for the call. Harness MCP tools require this field in their JSON schema and strip it before dispatching to business callbacks. Claude Code built-in tools are governed by the shared role prompt and should also include `intend` whenever the underlying tool schema accepts it.
+Every HarnessingTS MCP tool call must include an `intend` argument: one short sentence describing the immediate reason for the call. The bridge requires this field in its JSON schema and strips it before dispatching to business callbacks. DSH native tools follow their own published schemas.
 
-The backend converts SDK `tool_use` messages into `tool_call` parts. When the matching SDK `tool_result` arrives with the same `toolUseId`, the log entry is updated so the call and result are represented as one message:
+The backend projects assistant messages and `tool/call` / `tool/result` JSON-RPC events into the workspace JSONL transcript. The raw payload of each stored tool event remains available for audit. DSH keeps the complete durable session stream in `.dsh-sessions/`; the HarnessingTS timeline records application-level state and audit effects rather than claiming to duplicate every wire event.
 
-```json
-{
-  "type": "tool_call",
-  "name": "Read",
-  "intend": "Read the contract to confirm the current task boundary.",
-  "input": {"file_path": "user/problem-contract.md", "intend": "..."},
-  "status": "completed",
-  "resultText": "..."
-}
-```
-
-The frontend renders `tool_call` messages collapsed by default. The row title shows `intend`; expanded details show tool name, status, full parameters, and returned result text.
+The backend projects DSH `tool/call` / `tool/result` events into the same intent-bearing, correlated tool-call cards used by the former Claude integration, while retaining the complete JSON-RPC event as the card's raw audit payload. The frontend renders these concise, expandable cards across main, node, knowledge-graph-builder, and chain-summary-builder views, but suppresses unprojected telemetry and other raw protocol events.
 
 ## MCP Boundary
 

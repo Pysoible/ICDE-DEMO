@@ -9,7 +9,7 @@ import time
 from typing import Any, Callable
 from uuid import uuid4
 
-from harnessing_ts.agent.translate import collapse_tool_parts, filter_display_parts
+from harnessing_ts.agent.translate import collapse_tool_parts, filter_display_parts, project_dsh_tool_events
 from harnessing_ts.schema import CONTROL_MODES, NODE_TYPES, ControlRequest, NodeSession, NodeType, Part, RunRecord, RuntimeSettings, TimelineEvent, WorkspaceState
 from harnessing_ts.state.jsonl import append_jsonl, clear_file, read_json, read_jsonl, write_json
 from harnessing_ts.state.workspace_layout import (
@@ -35,6 +35,7 @@ class WorkspaceStore:
         self.knowledge_reasoning_log_path = root / "logs" / "knowledge-reasoning.jsonl"
         self.chain_summary_log_path = root / "logs" / "chain-builder.jsonl"
         self.runtime_path = root / "state" / "runtime.json"
+        self.execution_path = root / "state" / "execution.json"
         self.runtime_settings_path = root / "state" / "runtime-settings.json"
         self.knowledge_graph_llm_path = root / "state" / "knowledge-graph-llm.json"
         self.knowledge_graph_status_path = root / "state" / "knowledge-graph-build.json"
@@ -74,11 +75,12 @@ class WorkspaceStore:
             if "mainSdkSessionId" not in existing:
                 existing["mainSdkSessionId"] = None
                 self.write_state(existing)
-            if "mainResumeMode" not in existing:
-                existing["mainResumeMode"] = "new_session"
-                self.write_state(existing)
             if "contractConfirmed" not in existing:
                 existing["contractConfirmed"] = bool(existing.pop("taskContractConfirmed", False))
+                self.write_state(existing)
+            if "contractReady" not in existing:
+                completed = set(existing.get("completedNodes") or [])
+                existing["contractReady"] = "problem-contract" in completed
                 self.write_state(existing)
             if "finalSummaryConfirmed" not in existing:
                 existing["finalSummaryConfirmed"] = bool(existing.pop("finalSolutionConfirmed", False))
@@ -113,10 +115,10 @@ class WorkspaceStore:
             "activeNodeSessionId": None,
             "completedNodes": [],
             "contractConfirmed": False,
+            "contractReady": False,
             "finalSummaryConfirmed": False,
             "runtimeSettings": self.read_runtime_settings(),
             "mainSdkSessionId": None,
-            "mainResumeMode": "new_session",
         }
         self.write_state(state)
         self.append_timeline({"type": "workspace_initialized", "timestamp": ts, "payload": {"mode": state["mode"]}})
@@ -289,7 +291,7 @@ class WorkspaceStore:
     def write_main_llm_config(self, values: dict[str, Any]) -> dict[str, Any]:
         current = self.read_main_llm_config()
         merged = dict(current)
-        for key in ("authMode", "protocol", "model", "apiKey", "baseUrl", "contextWindow"):
+        for key in ("authMode", "protocol", "model", "apiKey", "baseUrl"):
             if key not in values:
                 continue
             value = values[key]
@@ -314,7 +316,7 @@ class WorkspaceStore:
     def write_knowledge_graph_llm_config(self, values: dict[str, Any]) -> dict[str, Any]:
         current = self.read_knowledge_graph_llm_config()
         merged = dict(current)
-        for key in ("authMode", "protocol", "model", "apiKey", "baseUrl", "contextWindow"):
+        for key in ("authMode", "protocol", "model", "apiKey", "baseUrl"):
             if key not in values:
                 continue
             value = values[key]
@@ -378,8 +380,9 @@ class WorkspaceStore:
 
         return read_knowledge_base_cards(self.root, kind, limit)
 
-    def read_knowledge_graph_parts(self) -> list[Part]:
-        return filter_display_parts(collapse_tool_parts(read_jsonl(self.knowledge_graph_log_path)))
+    def read_knowledge_graph_parts(self, limit: int | None = 200) -> list[Part]:
+        parts = filter_display_parts(collapse_tool_parts(project_dsh_tool_events(read_jsonl(self.knowledge_graph_log_path))))
+        return parts[-limit:] if limit is not None else parts
 
     def clear_knowledge_graph(self) -> None:
         _remove_path(self.root / "knowledge_base")
@@ -412,12 +415,19 @@ class WorkspaceStore:
         write_json(self.chain_summary_path, summary)
         return summary
 
-    def read_chain_summary_parts(self) -> list[Part]:
-        return filter_display_parts(collapse_tool_parts(read_jsonl(self.chain_summary_log_path)))
+    def read_chain_summary_parts(self, limit: int | None = 200) -> list[Part]:
+        parts = filter_display_parts(collapse_tool_parts(project_dsh_tool_events(read_jsonl(self.chain_summary_log_path))))
+        return parts[-limit:] if limit is not None else parts
 
     def write_state(self, state: WorkspaceState) -> None:
         state["updatedAt"] = now_iso()
         write_json(self.state_path, state)
+
+    def read_execution(self) -> dict[str, Any] | None:
+        return read_json(self.execution_path)
+
+    def write_execution(self, execution: dict[str, Any]) -> None:
+        write_json(self.execution_path, execution)
 
     def create_node_session(self, node_type: NodeType, rationale: str | None = None, input_summary: str | None = None) -> NodeSession:
         node: NodeSession = {
@@ -486,14 +496,17 @@ class WorkspaceStore:
             "payload": record,
         })
 
-    def read_timeline(self) -> list[TimelineEvent]:
-        return read_jsonl(self.timeline_path)
+    def read_timeline(self, limit: int | None = 500) -> list[TimelineEvent]:
+        events = read_jsonl(self.timeline_path)
+        return events[-limit:] if limit is not None else events
 
-    def read_main_parts(self) -> list[Part]:
-        return filter_display_parts(collapse_tool_parts(read_jsonl(self.main_log_path)))
+    def read_main_parts(self, limit: int | None = 200) -> list[Part]:
+        parts = filter_display_parts(collapse_tool_parts(project_dsh_tool_events(read_jsonl(self.main_log_path))))
+        return parts[-limit:] if limit is not None else parts
 
-    def read_node_parts(self, node_session_id: str) -> list[Part]:
-        return filter_display_parts(collapse_tool_parts(read_jsonl(self.node_log_path(node_session_id))))
+    def read_node_parts(self, node_session_id: str, limit: int | None = 200) -> list[Part]:
+        parts = filter_display_parts(collapse_tool_parts(project_dsh_tool_events(read_jsonl(self.node_log_path(node_session_id)))))
+        return parts[-limit:] if limit is not None else parts
 
     def list_file_tree(self, max_depth: int = 5, max_children_per_dir: int = 100) -> dict[str, Any]:
         self.ensure_layout()
@@ -763,6 +776,88 @@ class WorkspaceStore:
         })
         return state
 
+    def reset_workflow_preserving_assets(self) -> WorkspaceState:
+        """Return to the first main-session state without deleting user assets.
+
+        This differs from ``reset_chat`` in one important respect: the first
+        visible user message is retained as the task's immutable starting
+        instruction.  Uploaded raw data, references, and the completed
+        knowledge graph are likewise retained; derived workflow outputs and
+        all DSH session history are deliberately removed.
+        """
+        existing = self.read_state() or {}
+        control_mode = "auto" if existing.get("controlMode") == "auto" else "manual"
+        runtime_settings = self.read_runtime_settings()
+        initial_user_part = next(
+            (
+                part for part in read_jsonl(self.main_log_path)
+                if part.get("role") == "user" and part.get("type") == "text" and str(part.get("text") or "").strip()
+            ),
+            None,
+        )
+        retained_timeline_types = {
+            "workspace_initialized", "variant_selected", "raw_data_zip_uploaded",
+            "reference_uploaded", "knowledge_graph_build_started", "knowledge_graph_build_completed",
+            "knowledge_graph_build_failed", "knowledge_graph_build_paused",
+        }
+        retained_timeline = [
+            event for event in read_jsonl(self.timeline_path)
+            if event.get("type") in retained_timeline_types
+        ]
+
+        for rel in (
+            "user", "data/processed", "plots", "runs", "reports", "training",
+            "logs/nodes", "state/nodes", ".dsh-sessions",
+        ):
+            _remove_path(self.root / rel)
+
+        tools_root = self.root / "tools"
+        if tools_root.exists():
+            for child in tools_root.iterdir():
+                _remove_path(child)
+
+        artifacts_root = self.root / "artifacts"
+        if artifacts_root.exists():
+            for child in artifacts_root.iterdir():
+                if child.name != "knowledge-graph.json":
+                    _remove_path(child)
+
+        for path in (
+            self.state_path,
+            self.execution_path,
+            self.main_log_path,
+            self.timeline_path,
+            self.reference_feature_status_path,
+            self.chain_summary_status_path,
+            self.chain_summary_path,
+        ):
+            path.unlink(missing_ok=True)
+
+        self.ensure_layout()
+        ts = now_iso()
+        state = self._new_workspace_state(control_mode, runtime_settings, ts)
+        self.write_state(state)
+        for event in retained_timeline:
+            append_jsonl(self.timeline_path, event)
+        if initial_user_part:
+            append_jsonl(self.main_log_path, initial_user_part)
+            append_jsonl(self.timeline_path, {
+                "type": "user_message",
+                "timestamp": initial_user_part.get("timestamp") or ts,
+                "message": str(initial_user_part.get("text") or "")[:500],
+                "payload": {"restoredBy": "workflow_reset"},
+            })
+        self.append_timeline({
+            "type": "workflow_reset_preserving_assets",
+            "timestamp": ts,
+            "message": "Workflow state reset while preserving uploaded data, references, knowledge graph, and initial user message.",
+            "payload": {
+                "preserved": ["data/raw", "references", "knowledge_base", "artifacts/knowledge-graph.json", "state/knowledge-graph-build.json", "logs/knowledge-graph-builder.jsonl", "logs/knowledge-reasoning.jsonl", "main initial user message"],
+                "cleared": ["workflow outputs", "node sessions/logs", "main DSH session", "node DSH sessions"],
+            },
+        })
+        return state
+
     def reset_workspace(self) -> WorkspaceState:
         existing = self.read_state() or {}
         control_mode = "auto" if existing.get("controlMode") == "auto" else "manual"
@@ -785,7 +880,7 @@ class WorkspaceStore:
         ):
             _remove_path(self.root / rel)
 
-        for path in (self.state_path, self.knowledge_graph_status_path, self.knowledge_graph_path):
+        for path in (self.state_path, self.execution_path, self.knowledge_graph_status_path, self.knowledge_graph_path):
             path.unlink(missing_ok=True)
         for path in (self.chain_summary_status_path, self.chain_summary_path):
             path.unlink(missing_ok=True)
@@ -829,8 +924,10 @@ class WorkspaceStore:
             "activeNodeSessionId": None,
             "completedNodes": [],
             "contractConfirmed": False,
+            "contractReady": False,
             "finalSummaryConfirmed": False,
             "runtimeSettings": runtime_settings,
+            "mainSdkSessionId": None,
         }
 
 
@@ -898,15 +995,13 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
 
 def _sanitize_llm_config(raw: dict[str, Any], *, default_auth_mode: str) -> dict[str, Any]:
     auth = raw.get("authMode") if raw.get("authMode") in {"manual", "sdk-default"} else default_auth_mode
-    protocol = raw.get("protocol") if raw.get("protocol") in {"anthropic", "openai-compat"} else None
-    context = raw.get("contextWindow") if raw.get("contextWindow") in {"200k", "1m"} else None
+    protocol = raw.get("protocol") if raw.get("protocol") in {"deepseek", "openai-compat"} else None
     return {
         "authMode": auth,
         "model": raw.get("model") if isinstance(raw.get("model"), str) else "",
         "apiKey": raw.get("apiKey") if isinstance(raw.get("apiKey"), str) else None,
         "baseUrl": raw.get("baseUrl") if isinstance(raw.get("baseUrl"), str) else None,
         "protocol": protocol,
-        "contextWindow": context,
     }
 
 

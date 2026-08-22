@@ -3051,6 +3051,11 @@ details[open] > summary.panel-heading::after {
   background: var(--green-soft);
 }
 
+.tool-status.failed {
+  color: var(--red);
+  background: var(--red-soft);
+}
+
 .tool-copy {
   min-width: 0;
   display: grid;
@@ -3497,59 +3502,16 @@ dialog pre {
   border-radius: 0;
 }
 
-.pause-dialog {
-  width: min(620px, calc(100vw - 36px));
-}
 
-.pause-dialog-intro {
-  margin: 0;
-  padding: 16px 18px 4px;
-  color: var(--muted);
-  line-height: 1.5;
-}
-
-.pause-options {
-  display: grid;
-  gap: 10px;
-  padding: 12px 18px 16px;
-}
-
-.pause-option {
-  display: grid;
-  gap: 5px;
-  padding: 14px 15px;
-  border: 1px solid var(--line);
+.pause-wait-hint {
+  margin: 0 0 8px;
+  padding: 9px 12px;
+  border: 1px solid rgba(183, 122, 0, 0.28);
   border-radius: 10px;
-  background: var(--surface);
-  color: var(--ink);
-  text-align: left;
-}
-
-.pause-option:hover {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  transform: none;
-}
-
-.pause-option strong {
-  font-size: 14px;
-}
-
-.pause-option span {
-  color: var(--muted);
+  background: rgba(255, 244, 214, 0.82);
+  color: #865700;
   font-size: 12px;
   line-height: 1.45;
-}
-
-.pause-option-danger:hover {
-  border-color: var(--red);
-  background: var(--red-soft);
-}
-
-.pause-dialog-footer {
-  display: flex;
-  justify-content: flex-end;
-  padding: 0 18px 18px;
 }
 
 @keyframes spin {

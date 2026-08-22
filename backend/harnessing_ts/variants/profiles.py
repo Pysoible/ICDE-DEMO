@@ -16,7 +16,7 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
     "KTL": "knowledge-to-tools node and reference feature extractor",
     "CRV": "case-level review and attribution",
     "CXR": "case-level review without executing the reference feature extractor",
-    "SUB": "independent Task subagents",
+    "SUB": "independent candidate reviews",
     "ADA": "adaptive iterative solving",
     "DIR": "direct single-agent tool-use baseline",
 }

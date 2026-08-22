@@ -1,13 +1,14 @@
 [project]
 name = "harnessing-ts"
 version = "0.1.0"
-description = "Python backend for a time-series tool-use harness built on Claude Code SDK."
+description = "Python backend for a time-series tool-use harness built on DeepSeek Harness."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "anyio>=4.9,<4.11",
-  "claude-code-sdk>=0.0.22",
+  "deepseek-harness-sdk>=0.1.0rc7,<0.2",
   "fastapi>=0.116.0,<0.136.0",
+  "mcp>=1.27,<2",
   "python-docx>=1.1.2",
   "python-multipart>=0.0.20",
   "pydantic>=2.10.0",
@@ -42,3 +43,4 @@ packages = ["backend/harnessing_ts"]
 
 [tool.pytest.ini_options]
 pythonpath = ["backend"]
+testpaths = ["tests"]

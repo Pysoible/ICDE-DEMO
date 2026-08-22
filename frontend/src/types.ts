@@ -41,6 +41,18 @@ export type Bootstrap = {
     pipelineComplete?: boolean;
     workspaceUv?: JsonMap | null;
   };
+  execution?: {
+    actorId?: string;
+    sessionId?: string | null;
+    phase?: 'ready' | 'running' | 'pausing' | 'paused' | 'recovering' | 'failed';
+    epoch?: number;
+    operationId?: string | null;
+    checkpointSeq?: number;
+    canPause?: boolean;
+    canForceStop?: boolean;
+    canContinue?: boolean;
+    lastError?: string | null;
+  };
   knowledgeGraphBuild?: JsonMap;
   knowledgeGraphLlmConfig?: JsonMap;
 };

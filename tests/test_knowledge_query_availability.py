@@ -110,17 +110,18 @@ def test_fqa_node_runner_receives_query_callback_after_source_ready(tmp_path, mo
     assert build.call_args.kwargs["query_knowledge"] == orchestrator.request_query_knowledge
 
 
-def test_node_runner_reuses_selected_sdk_session(tmp_path, monkeypatch) -> None:
+def test_node_runner_resumes_dsh_session_after_restart(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("TS_HARNESS_VARIANT", "NOD-FQA-KTL-CXR-SUB-ADA")
     orchestrator = HarnessOrchestrator(tmp_path, dry_run=False)
     orchestrator.initialize()
     node = orchestrator.store.create_node_session("iterative-solving")
     node["sdkSessionId"] = "previous-sdk-session"
-    node["resumeMode"] = "resume_keep"
 
     with patch("harnessing_ts.orchestrator.build_node_runner", return_value=MagicMock()) as build:
         orchestrator._spawn_node_runner(node)
 
+    # The local DSH JSONL persistence/checkpoint composition restores the
+    # durable session id after a runtime restart.
     assert build.call_args.kwargs["resume_session_id"] == "previous-sdk-session"
 
 

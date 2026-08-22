@@ -22,7 +22,7 @@ class RealtimeEvent:
 
 
 class RealtimeEventBroker:
-    def __init__(self, *, queue_size: int = 64) -> None:
+    def __init__(self, *, queue_size: int = 256) -> None:
         self.queue_size = queue_size
         self._next_id = 1
         self._subscribers: set[asyncio.Queue[RealtimeEvent]] = set()
