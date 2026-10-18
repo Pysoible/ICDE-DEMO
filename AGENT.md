@@ -62,6 +62,8 @@ uv run ts-harness --dry-run finish-node --summary "..." --goal-met true --output
 - `backend/harnessing_ts/reference_feature_extractor.py`：reference feature extractor 的强校验、执行和 inspection。
 - `frontend/src/main.ts`：当前主要 UI 渲染和事件绑定入口。
 - `frontend/src/types.ts`：frontend DTO 类型。
+- `backend/harnessing_ts/expert_collaboration.py`：ICDE 专家协作的受限检查规划、结构化建议和真实文本差异。模型提示词位于 `config/prompts/expert-collaboration/`；`demo_interactions.py` 负责路由、工具执行及版本化保存。
+- 专家建议、接受决定和发布报告是独立操作。不得自动选择诊断标签、覆盖预测、修改工具或将建议当成临床结论。跨模型调用须重检 context 和报告版本；协作历史单独计版本，保留既有报告/病人反馈。受 no-KTL/no-CRV/CXR 能力约束。
 
 新增行为应落在已有边界内。不要把 node 路由规则重新写回 `orchestrator.py`，不要把 workspace layout 细节塞进 `WorkspaceStore` 主体，不要把 API 聚合 payload 散落在路由函数里。消融行为必须通过 capabilities、工具注入和后端契约强制实施，不能只靠 prompt 声明。
 
@@ -208,6 +210,8 @@ bun run build
 - `DIR` exposes direct tools and no node specs.
 
 ## Git 和提交
+
+专家协作变更须运行 `tests/test_expert_collaboration.py`、既有 demo/patient 测试及前端类型检查/构建；真实模型验证使用隔离 review storage，禁止发布伪造临床报告。详见 `docs/EXPERT_COLLABORATION.md`。
 
 - 每次完成一个逻辑完整改动后提交，不要积攒大量无关改动。
 - 提交前检查 `git status`，不要覆盖用户或其他 agent 的未提交改动。

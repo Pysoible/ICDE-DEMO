@@ -1,0 +1,11 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {escapeHtml,formatMeasurement,statusLabel,criterionText,previewCounts,defaultCohort,focusLead,validReview} from '../src/demo_view.ts';
+test('measurement zero and unknown remain distinct',()=>{assert.equal(formatMeasurement({value:0,unit:'ms'}),'0 ms');assert.equal(formatMeasurement({value:null}),'Not measurable');assert.equal(formatMeasurement({value:{count:0}}),'0 leads');assert.equal(formatMeasurement({value:NaN}),'Not measurable');});
+test('review status never becomes a patient diagnosis',()=>{assert.equal(statusLabel('normal'),'Within reference');assert.equal(statusLabel('indeterminate'),'Not assessable');});
+test('bounded criterion builder preserves units and rejects unsupported input',()=>{assert.equal(criterionText('QRS','>=',120),'QRS >= 120 ms: needs review');assert.equal(criterionText('Q wave count','>=',1),'Q wave count >= 1 leads: needs review');assert.throws(()=>criterionText('MI','>=',1));assert.throws(()=>criterionText('PR','>=',NaN));assert.throws(()=>criterionText('PR','=',100));});
+test('unknown preview results are never counted as negative',()=>{assert.deepEqual(previewCounts([{matched:true},{matched:false},{matched:null}]),{flagged:1,clear:1,unknown:1,total:3});});
+test('cohort uses only available records without duplicates',()=>{assert.deepEqual(defaultCohort(26,[26,41,62]),[26,41,62]);assert.ok(defaultCohort(999,[26,62]).every(id=>id!==999));});
+test('focus is an actual available lead, not a fabricated interval',()=>{assert.equal(focusLead({value:{lead_of_max:'aVF'}},['I','AVF']),'AVF');assert.equal(focusLead({value:{leads:[{lead:'III'}]}},['II','III']),'III');assert.equal(focusLead({value:{qrs_ms:82.5}},['II']),null);});
+test('review publication requires deliberate labels and supporting note',()=>{assert.ok(validReview([], 'An adequate note.'));assert.ok(validReview(['NORM','CD'],'An adequate note.'));assert.ok(validReview(['CD'],' '));assert.equal(validReview(['CD'],'Illustrative software test note.'),null);});
+test('source and note text cannot inject markup',()=>{assert.equal(escapeHtml('<script>"x"</script>'),'&lt;script&gt;&quot;x&quot;&lt;/script&gt;');});

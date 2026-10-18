@@ -8,6 +8,7 @@ dependencies = [
   "anyio>=4.9,<4.11",
   "deepseek-harness-sdk>=0.1.0rc7,<0.2",
   "fastapi>=0.116.0,<0.136.0",
+  "httpx>=0.28.0,<1",
   "mcp>=1.27,<2",
   "python-docx>=1.1.2",
   "python-multipart>=0.0.20",

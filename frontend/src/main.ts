@@ -1,5 +1,6 @@
 import './styles.css';
 import { deleteJson, fetchJson, postForm, postJson } from './api';
+import { getClinicalReview, renderClinicalReview, renderPatientReport, saveClinicalReview } from './clinical_demo';
 import DOMPurify from 'dompurify';
 import { forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY } from 'd3-force';
 import {
@@ -56,11 +57,15 @@ const state = {
     ? 'knowledgeGraph'
     : window.location.pathname === '/chain-summary'
     ? 'chainSummary'
+    : window.location.pathname === '/ecg-samples'
+    ? 'ecgSamples'
+    : window.location.pathname === '/patient'
+    ? 'patient'
     : window.location.pathname === '/image-viewer'
     ? 'imageViewer'
     : window.location.pathname === '/settings'
     ? 'settings'
-    : 'chat') as 'chat' | 'knowledgeGraph' | 'chainSummary' | 'imageViewer' | 'settings'),
+    : 'chat') as 'chat' | 'knowledgeGraph' | 'chainSummary' | 'ecgSamples' | 'patient' | 'imageViewer' | 'settings'),
   selectedImagePath: new URLSearchParams(window.location.search).get('path') || '',
   selectedGraphNodeId: null as string | null,
   knowledgeGraphTab: 'graph' as 'graph' | 'trace',
@@ -104,6 +109,22 @@ const state = {
   chainStatusSignature: '',
   chainChartSignature: '',
   chainContentSignature: '',
+  ecgOverview: null as JsonMap | null,
+  ecgDatasets: [] as JsonMap[],
+  ecgDatasetKey: '',
+  ecgWaveform: null as JsonMap | null,
+  ecgBusy: false,
+  ecgError: '',
+  ecgStatus: 'errors' as 'all' | 'errors' | 'correct',
+  ecgLabel: '',
+  selectedEcgId: null as number | null,
+  patientOverview: null as JsonMap | null,
+  patientSampleId: null as number | null,
+  patientBusy: false,
+  patientError: '',
+  patientMessages: [] as Array<{ role: 'user' | 'assistant'; text: string; source?: 'llm' | 'safety' | 'error' }>,
+  patientQaBusy: false,
+  patientQaRequestId: 0,
   renderSignatures: new Map<string, string>(),
   realtimeWaiters: [] as Array<{
     predicate: (data: Bootstrap) => boolean;
@@ -122,15 +143,15 @@ const app = document.querySelector<HTMLDivElement>('#app');
 if (!app) throw new Error('Missing #app root');
 
 app.innerHTML = `
-  <button id="leftRailToggle" class="rail-toggle left-toggle" type="button" title="折叠左栏"><span data-icon="ChevronLeft"></span></button>
-  <button id="rightRailToggle" class="rail-toggle right-toggle" type="button" title="折叠右栏"><span data-icon="ChevronRight"></span></button>
+  <button id="leftRailToggle" class="rail-toggle left-toggle" type="button" title="Collapse left sidebar"><span data-icon="ChevronLeft"></span></button>
+  <button id="rightRailToggle" class="rail-toggle right-toggle" type="button" title="Collapse right sidebar"><span data-icon="ChevronRight"></span></button>
 
   <aside class="left-rail">
     <section class="brand-block">
       <div class="brand-mark" data-icon="Sparkles"></div>
       <div>
         <h1>HarnessingTS</h1>
-        <p>时间序列智能工作台</p>
+        <p>Time-Series Agent Workbench</p>
       </div>
     </section>
 
@@ -138,39 +159,39 @@ app.innerHTML = `
     <section class="panel status-panel">
       <div class="panel-heading">
         <span data-icon="Gauge"></span>
-        <span>工作区</span>
+        <span>Workspace</span>
       </div>
       <dl class="kv">
-        <dt>状态</dt>
-        <dd id="statusText">加载中</dd>
-        <dt>模式</dt>
+        <dt>Status</dt>
+        <dd id="statusText">Loading</dd>
+        <dt>Mode</dt>
         <dd id="modeText">-</dd>
-        <dt>流程</dt>
+        <dt>Workflow</dt>
         <dd id="variantText">-</dd>
-        <dt>模型</dt>
+        <dt>Model</dt>
         <dd id="modelText">-</dd>
-        <dt>环境</dt>
+        <dt>Environment</dt>
         <dd id="runtimeUvText">-</dd>
       </dl>
-      <button id="settingsBtn" type="button" class="workspace-settings-btn"><span data-icon="SlidersHorizontal"></span><span>工作区设置</span></button>
+      <button id="settingsBtn" type="button" class="workspace-settings-btn"><span data-icon="SlidersHorizontal"></span><span>Workspace settings</span></button>
     </section>
 
     <section id="pendingControlPanel" class="panel control-panel" hidden>
       <div class="panel-heading">
         <span data-icon="ShieldCheck"></span>
-        <span>等待确认</span>
+        <span>Awaiting approval</span>
       </div>
       <div id="pendingControlBody" class="control-body"></div>
       <div class="split-actions">
-        <button id="approveControlBtn" type="button" class="success-btn"><span data-icon="Check"></span><span>同意</span></button>
-        <button id="rejectControlBtn" type="button" class="danger ghost"><span data-icon="X"></span><span>拒绝</span></button>
+        <button id="approveControlBtn" type="button" class="success-btn"><span data-icon="Check"></span><span>Approve</span></button>
+        <button id="rejectControlBtn" type="button" class="danger ghost"><span data-icon="X"></span><span>Reject</span></button>
       </div>
     </section>
 
     <section class="panel">
       <div class="panel-heading">
         <span data-icon="GitBranch"></span>
-        <span>节点流程</span>
+        <span>Workflow stages</span>
       </div>
       <div id="nodeList" class="node-list"></div>
     </section>
@@ -178,7 +199,7 @@ app.innerHTML = `
     <section class="panel">
       <div class="panel-heading">
         <span data-icon="Boxes"></span>
-        <span>当前节点</span>
+        <span>Current stage</span>
       </div>
       <div id="nodeDetail" class="node-detail"></div>
     </section>
@@ -186,7 +207,7 @@ app.innerHTML = `
     <details class="panel timeline-panel">
       <summary class="panel-heading">
         <span data-icon="Clock3"></span>
-        <span>时间线</span>
+        <span>Timeline</span>
       </summary>
       <div id="timeline" class="timeline"></div>
     </details>
@@ -196,62 +217,62 @@ app.innerHTML = `
       <section class="panel graph-control-card">
         <div class="panel-heading">
           <span data-icon="Settings2"></span>
-          <span>构建设置</span>
+          <span>Build settings</span>
         </div>
         <div id="graphBuildStatus" class="graph-build-status"></div>
         <div id="graphLeftActions" class="graph-left-actions">
-          <button id="buildGraphBtn" type="button"><span data-icon="RefreshCw"></span><span>构建</span></button>
-          <button id="rebuildGraphBtn" type="button" class="rebuild" hidden><span data-icon="RotateCcw"></span><span>重建</span></button>
-          <button id="continueGraphBtn" type="button" class="secondary"><span data-icon="Play"></span><span>继续</span></button>
-          <button id="pauseGraphBtn" type="button" class="danger ghost"><span data-icon="Pause"></span><span>暂停</span></button>
+          <button id="buildGraphBtn" type="button"><span data-icon="RefreshCw"></span><span>Build</span></button>
+          <button id="rebuildGraphBtn" type="button" class="rebuild" hidden><span data-icon="RotateCcw"></span><span>Rebuild</span></button>
+          <button id="continueGraphBtn" type="button" class="secondary"><span data-icon="Play"></span><span>Continue</span></button>
+          <button id="pauseGraphBtn" type="button" class="danger ghost"><span data-icon="Pause"></span><span>Pause</span></button>
         </div>
       </section>
 
       <details class="panel graph-settings-card">
         <summary class="panel-heading">
           <span data-icon="SlidersHorizontal"></span>
-          <span>详细设置</span>
+          <span>Advanced settings</span>
         </summary>
         <div class="graph-settings-body">
         <label>
-          <span>抽取深度</span>
+          <span>Extraction depth</span>
           <input id="graphExtractionDepthInput" type="number" min="1" max="4" step="1" />
         </label>
         <label>
-          <span>认证方式</span>
+          <span>Authentication</span>
           <select id="graphAuthMode">
-            <option value="manual">手动配置</option>
-            <option value="sdk-default">SDK 默认</option>
+            <option value="manual">Manual configuration</option>
+            <option value="sdk-default">SDK default</option>
           </select>
         </label>
         <label>
-          <span>协议</span>
+          <span>Protocol</span>
           <select id="graphProtocol">
-            <option value="">自动</option>
+            <option value="">Auto</option>
             <option value="deepseek">deepseek</option>
             <option value="openai-compat">openai-compat</option>
           </select>
         </label>
         <label>
-          <span>模型</span>
-          <input id="graphModelInput" type="text" placeholder="默认继承主模型" />
+          <span>Model</span>
+          <input id="graphModelInput" type="text" placeholder="Inherit primary model" />
         </label>
         <label>
-          <span>接口地址</span>
-          <input id="graphBaseUrlInput" type="text" placeholder="默认继承主接口地址" />
+          <span>API base URL</span>
+          <input id="graphBaseUrlInput" type="text" placeholder="Inherit primary API URL" />
         </label>
         <label>
-          <span>API 密钥</span>
-          <input id="graphApiKeyInput" type="password" placeholder="留空表示保持当前密钥" />
+          <span>API key</span>
+          <input id="graphApiKeyInput" type="password" placeholder="Leave blank to keep the current key" />
         </label>
-        <button id="saveGraphLlmBtn" type="button" class="secondary full-width"><span data-icon="Check"></span><span>保存构建模型</span></button>
+        <button id="saveGraphLlmBtn" type="button" class="secondary full-width"><span data-icon="Check"></span><span>Save graph model</span></button>
         </div>
       </details>
 
       <section class="panel">
         <div class="panel-heading">
           <span data-icon="Gauge"></span>
-          <span>知识库</span>
+          <span>Knowledge base</span>
         </div>
         <div class="knowledge-summary" id="knowledgeSummary"></div>
         <div class="knowledge-card-list" id="knowledgeCards"></div>
@@ -263,33 +284,33 @@ app.innerHTML = `
     <header class="toolbar">
       <div class="toolbar-main">
         <div class="title-group">
-          <div class="eyebrow"><span data-icon="Bot"></span><span>主会话</span></div>
-          <h2 id="mainTitle">任务编排</h2>
+          <div class="eyebrow"><span data-icon="Bot"></span><span>Main session</span></div>
+          <h2 id="mainTitle">Task orchestration</h2>
         </div>
         <label class="transcript-filter">
-          <span>记录范围</span>
+          <span>Transcript scope</span>
           <select id="transcriptScope"></select>
         </label>
       </div>
       <div class="toolbar-actions">
-        <button id="resetChatBtn" type="button" class="ghost debug-only"><span data-icon="RefreshCw"></span><span>重置会话</span></button>
-        <button id="clearAllLogsBtn" type="button" class="danger ghost debug-only"><span data-icon="Trash2"></span><span>重置工作区</span></button>
+        <button id="resetChatBtn" type="button" class="ghost debug-only"><span data-icon="RefreshCw"></span><span>Reset conversation</span></button>
+        <button id="clearAllLogsBtn" type="button" class="danger ghost debug-only"><span data-icon="Trash2"></span><span>Reset workspace</span></button>
       </div>
     </header>
 
     <section id="chatStream" class="chat-stream"></section>
-    <button id="chatTopBtn" type="button" class="chat-top-btn" title="回到顶部" aria-label="回到顶部"><span data-icon="ArrowUp"></span></button>
+    <button id="chatTopBtn" type="button" class="chat-top-btn" title="Back to top" aria-label="Back to top"><span data-icon="ArrowUp"></span></button>
 
     <section id="settingsView" class="settings-view" hidden>
       <header class="settings-header">
         <div class="settings-header-inner">
           <div class="settings-header-text">
-            <div class="settings-eyebrow"><span data-icon="SlidersHorizontal"></span><span>工作区</span></div>
-            <h1 class="settings-title">设置</h1>
-            <p class="settings-subtitle">这里集中管理当前工作区的运行参数和模型配置。部分改动会立即生效，部分会在下一条消息后生效。</p>
+            <div class="settings-eyebrow"><span data-icon="SlidersHorizontal"></span><span>Workspace</span></div>
+            <h1 class="settings-title">Settings</h1>
+            <p class="settings-subtitle">Manage runtime settings and model configuration for this workspace. Some changes take effect immediately; others apply to the next message.</p>
           </div>
           <div class="settings-header-actions">
-            <button id="settingsDoneBtn" type="button" class="settings-done-btn"><span data-icon="ChevronLeft"></span><span>返回主会话</span></button>
+            <button id="settingsDoneBtn" type="button" class="settings-done-btn"><span data-icon="ChevronLeft"></span><span>Back to main session</span></button>
           </div>
         </div>
       </header>
@@ -298,22 +319,22 @@ app.innerHTML = `
     <section id="knowledgeGraphView" class="knowledge-graph-view" hidden>
       <div class="graph-header">
         <div class="graph-title-block">
-          <div class="eyebrow"><span data-icon="Network"></span><span>知识图谱</span></div>
-          <h2 id="graphTitle">参考知识</h2>
+          <div class="eyebrow"><span data-icon="Network"></span><span>Knowledge graph</span></div>
+          <h2 id="graphTitle">Reference knowledge</h2>
         </div>
         <div class="graph-header-actions">
-          <button id="backToChatBtn" type="button" class="graph-back-button"><span data-icon="ChevronLeft"></span><span>返回主会话</span></button>
+          <button id="backToChatBtn" type="button" class="graph-back-button"><span data-icon="ChevronLeft"></span><span>Back to main session</span></button>
         </div>
       </div>
-      <nav class="graph-tabs" aria-label="知识图谱页面切换">
-        <button id="graphTabTrace" type="button" class="graph-tab" data-graph-tab="trace"><span data-icon="TerminalSquare"></span><span>构建过程</span></button>
-        <button id="graphTabGraph" type="button" class="graph-tab active" data-graph-tab="graph"><span data-icon="Network"></span><span>知识图谱</span></button>
+      <nav class="graph-tabs" aria-label="Knowledge graph views">
+        <button id="graphTabTrace" type="button" class="graph-tab" data-graph-tab="trace"><span data-icon="TerminalSquare"></span><span>Build process</span></button>
+        <button id="graphTabGraph" type="button" class="graph-tab active" data-graph-tab="graph"><span data-icon="Network"></span><span>Knowledge graph</span></button>
       </nav>
       <div id="graphTracePanel" class="graph-tab-panel graph-trace-panel" hidden>
         <section class="builder-trace-panel">
           <div class="panel-heading">
             <span data-icon="TerminalSquare"></span>
-            <span>构建过程记录</span>
+            <span>Build history</span>
           </div>
           <div id="builderTrace" class="builder-trace"></div>
         </section>
@@ -321,11 +342,11 @@ app.innerHTML = `
       <div id="graphKnowledgePanel" class="graph-tab-panel graph-knowledge-panel">
         <div id="graphLayout" class="graph-layout">
           <div id="graphCanvas" class="graph-canvas"></div>
-          <button id="graphInfoToggle" class="graph-info-toggle" type="button" title="折叠图谱信息"><span data-icon="ChevronRight"></span></button>
+          <button id="graphInfoToggle" class="graph-info-toggle" type="button" title="Collapse graph details"><span data-icon="ChevronRight"></span></button>
           <aside id="graphInfoPanel" class="graph-inspector-shell">
             <header class="graph-inspector-header">
               <span data-icon="Info"></span>
-              <span>图谱信息</span>
+              <span>Graph details</span>
             </header>
             <section id="graphInspector" class="graph-inspector"></section>
           </aside>
@@ -336,20 +357,20 @@ app.innerHTML = `
     <section id="chainSummaryView" class="chain-summary-view" hidden>
       <header class="chain-header">
         <div class="chain-title-block">
-          <div class="eyebrow"><span data-icon="Activity"></span><span>流程总结</span></div>
-          <h2>思维链总结</h2>
-          <p>把当前工作区的日志、迭代报告、运行结果和样本证据组织成一条可审计的决策链。</p>
+          <div class="eyebrow"><span data-icon="Activity"></span><span>Workflow summary</span></div>
+          <h2>Workflow summary</h2>
+          <p>Trace the decisions behind each iteration using logs, reports, results, and case evidence.</p>
         </div>
         <div class="chain-header-actions">
-          <button id="backToChatFromChainBtn" type="button" class="chain-back-btn"><span data-icon="ChevronLeft"></span><span>返回主会话</span></button>
-          <button id="buildChainSummaryBtn" type="button" class="chain-generate-btn"><span data-icon="RefreshCw"></span><span>生成思维链总结</span></button>
+          <button id="backToChatFromChainBtn" type="button" class="chain-back-btn"><span data-icon="ChevronLeft"></span><span>Back to main session</span></button>
+          <button id="buildChainSummaryBtn" type="button" class="chain-generate-btn"><span data-icon="RefreshCw"></span><span>Generate workflow summary</span></button>
         </div>
       </header>
       <div id="chainBody" class="chain-body">
-        <button id="chainNavToggle" class="chain-nav-toggle" type="button" title="折叠目录"><span data-icon="ChevronLeft"></span></button>
+        <button id="chainNavToggle" class="chain-nav-toggle" type="button" title="Collapse contents"><span data-icon="ChevronLeft"></span></button>
         <aside id="chainNav" class="chain-nav">
-          <div class="chain-nav-heading"><span data-icon="GitBranch"></span><span>导航窗格</span></div>
-          <nav id="chainNavContent" class="chain-nav-content" aria-label="思维链总结目录"></nav>
+          <div class="chain-nav-heading"><span data-icon="GitBranch"></span><span>Contents</span></div>
+          <nav id="chainNavContent" class="chain-nav-content" aria-label="Workflow summary sections"></nav>
         </aside>
         <div id="chainMainScroll" class="chain-main-scroll">
           <section id="chainBuildStatus" class="chain-build-status chain-anchor"></section>
@@ -359,68 +380,153 @@ app.innerHTML = `
       </div>
     </section>
 
+    <section id="ecgSamplesView" class="ecg-samples-view" hidden>
+      <header class="ecg-header">
+        <div>
+          <div class="eyebrow"><span data-icon="Activity"></span><span>Current dataset</span></div>
+          <h2>ECG Case Explorer</h2>
+          <p id="ecgWorkspaceMeta">Loading latest experiment results</p>
+        </div>
+        <div class="ecg-header-actions">
+          <a href="/demo" class="secondary" style="text-decoration:none;padding:10px 12px">Interactive Demo</a>
+          <button id="openPatientFromEcgBtn" type="button" class="secondary"><span data-icon="File"></span><span>Patient preview</span></button>
+          <button id="refreshEcgBtn" type="button" class="secondary"><span data-icon="RefreshCw"></span><span>Refresh</span></button>
+          <button id="backToChatFromEcgBtn" type="button" class="graph-back-button"><span data-icon="ChevronLeft"></span><span>Back to main session</span></button>
+        </div>
+      </header>
+      <section id="ecgMetricStrip" class="ecg-metric-strip"></section>
+      <div class="ecg-controls">
+        <label>Dataset
+          <select id="ecgDatasetSelect"></select>
+        </label>
+        <label>Case status
+          <select id="ecgStatusFilter">
+            <option value="errors">Error cases</option>
+            <option value="all">All cases</option>
+            <option value="correct">Correct cases</option>
+          </select>
+        </label>
+        <label>Class
+          <select id="ecgLabelFilter">
+            <option value="">All classes</option>
+            <option value="NORM">NORM</option>
+            <option value="MI">MI</option>
+            <option value="STTC">STTC</option>
+            <option value="CD">CD</option>
+            <option value="HYP">HYP</option>
+          </select>
+        </label>
+        <span id="ecgMatchCount" class="ecg-match-count"></span>
+      </div>
+      <div id="ecgEmptyState" class="ecg-empty-state" hidden></div>
+      <div id="ecgWorkbench" class="ecg-workbench" hidden>
+        <aside class="ecg-sample-browser">
+          <div class="ecg-pane-title">Case</div>
+          <div id="ecgSampleList" class="ecg-sample-list"></div>
+        </aside>
+        <section class="ecg-waveform-pane">
+          <div id="ecgWaveformHeading" class="ecg-pane-title">12-lead ECG</div>
+          <div id="ecgWaveformGrid" class="ecg-waveform-grid"></div>
+        </section>
+        <aside class="ecg-result-pane">
+          <div class="ecg-pane-title">Classification results</div>
+          <div id="ecgResultDetail"></div>
+          <div id="clinicalReviewPane" class="clinical-review-pane"></div>
+        </aside>
+      </div>
+    </section>
+
+    <section id="patientView" class="patient-view" hidden>
+      <header class="patient-header">
+        <div><div class="eyebrow"><span data-icon="File"></span><span>Patient view</span></div><h2>My ECG Report</h2><p>Explore a public dataset case. This is a demonstration, not personal medical care.</p></div>
+        <button id="backToEcgFromPatientBtn" type="button" class="secondary"><span data-icon="ChevronLeft"></span><span>Back to ECG cases</span></button>
+      </header>
+      <div class="patient-toolbar"><label for="patientSampleSelect">Demo case</label><select id="patientSampleSelect"></select><span id="patientDatasetName"></span></div>
+      <div id="patientEmptyState" class="patient-empty-state" hidden></div>
+      <div id="patientContent" class="patient-content" hidden>
+        <section class="patient-report"><div class="patient-section-heading"><span data-icon="File"></span><span>Report</span></div><div id="patientReportBody"></div></section>
+        <section class="patient-qa"><div class="patient-section-heading"><span data-icon="Bot"></span><span>Report Q&A</span><small>AI-assisted</small></div><div id="patientQaMessages" class="patient-qa-messages"></div><form id="patientQaForm"><label class="sr-only-file" for="patientQuestion">Ask a question</label><input id="patientQuestion" maxlength="300" placeholder="For example: What does this result mean?" required /><button type="submit"><span data-icon="Send"></span><span>Ask</span></button></form><p class="patient-qa-note">Your question, this case's model predictions, and any locally saved review labels are sent to the configured LLM. Answers are educational, not medical advice.</p></section>
+      </div>
+    </section>
+
     <section id="imageViewerView" class="image-viewer-view" hidden>
       <header class="image-viewer-header">
         <div>
-          <div class="eyebrow"><span data-icon="Activity"></span><span>总结图片</span></div>
-          <h2 id="imageViewerTitle">样本可视化</h2>
+          <div class="eyebrow"><span data-icon="Activity"></span><span>Summary figure</span></div>
+          <h2 id="imageViewerTitle">Case visualization</h2>
         </div>
-        <button id="backToChainFromImageBtn" type="button" class="chain-back-btn"><span data-icon="ChevronLeft"></span><span>返回思维链总结</span></button>
+        <button id="backToChainFromImageBtn" type="button" class="chain-back-btn"><span data-icon="ChevronLeft"></span><span>Back to workflow summary</span></button>
       </header>
       <section class="image-viewer-stage">
-        <img id="imageViewerImage" alt="流程总结可视化图片" />
+        <img id="imageViewerImage" alt="Workflow summary image" />
       </section>
       <div id="imageViewerPath" class="image-viewer-path"></div>
     </section>
 
     <form id="sendForm" class="composer">
       <p id="pauseWaitHint" class="pause-wait-hint" role="status" hidden></p>
-      <button id="forceStopBtn" type="button" class="danger ghost" hidden>强制停止</button>
+      <button id="forceStopBtn" type="button" class="danger ghost" hidden>Force stop</button>
       <div class="composer-shell">
-        <textarea id="messageInput" rows="1" placeholder="向任务编排器发送消息"></textarea>
-        <button id="interruptBtn" type="button" class="composer-stop-btn" title="暂停回答" hidden><span data-icon="Square"></span></button>
-        <button id="sendBtn" type="submit" class="send-round" title="发送" disabled><span data-icon="ArrowUp"></span></button>
+        <textarea id="messageInput" rows="1" placeholder="Message the task orchestrator"></textarea>
+        <button id="interruptBtn" type="button" class="composer-stop-btn" title="Pause response" hidden><span data-icon="Square"></span></button>
+        <button id="sendBtn" type="submit" class="send-round" title="Send" disabled><span data-icon="ArrowUp"></span></button>
       </div>
     </form>
   </main>
 
   <aside class="right-rail">
-    <button id="kgCta" class="kg-cta" type="button" data-state="idle" aria-label="打开知识图谱">
+    <button id="kgCta" class="kg-cta" type="button" data-state="idle" aria-label="Open knowledge graph">
       <div class="kg-cta-icon"><span data-icon="Network"></span></div>
       <div class="kg-cta-body">
-        <div class="kg-cta-eyebrow">参考知识</div>
-        <div class="kg-cta-title">知识图谱</div>
+        <div class="kg-cta-eyebrow">Reference knowledge</div>
+        <div class="kg-cta-title">Knowledge graph</div>
         <div class="kg-cta-meta">
-          <span class="kg-cta-pill" id="kgCtaPill">空闲</span>
-          <span class="kg-cta-stats" id="kgCtaStats">尚未构建</span>
+          <span class="kg-cta-pill" id="kgCtaPill">Idle</span>
+          <span class="kg-cta-stats" id="kgCtaStats">Not built</span>
         </div>
       </div>
       <div class="kg-cta-arrow"><span data-icon="ChevronRight"></span></div>
     </button>
-    <button id="chainCta" class="kg-cta chain-cta" type="button" data-state="idle" aria-label="打开流程总结">
+    <button id="chainCta" class="kg-cta chain-cta" type="button" data-state="idle" aria-label="Open workflow summary">
       <div class="kg-cta-icon"><span data-icon="Activity"></span></div>
       <div class="kg-cta-body">
-        <div class="kg-cta-eyebrow">执行轨迹</div>
-        <div class="kg-cta-title">思维链总结</div>
+        <div class="kg-cta-eyebrow">Execution trace</div>
+        <div class="kg-cta-title">Workflow summary</div>
         <div class="kg-cta-meta">
-          <span class="kg-cta-pill" id="chainCtaPill">空闲</span>
-          <span class="kg-cta-stats" id="chainCtaStats">尚未生成</span>
+          <span class="kg-cta-pill" id="chainCtaPill">Idle</span>
+          <span class="kg-cta-stats" id="chainCtaStats">Not generated</span>
         </div>
       </div>
       <div class="kg-cta-arrow"><span data-icon="ChevronRight"></span></div>
+    </button>
+    <button id="ecgCta" class="kg-cta ecg-cta" type="button" data-state="ready" aria-label="Open ECG Case Explorer">
+      <div class="kg-cta-icon"><span data-icon="Activity"></span></div>
+      <div class="kg-cta-body">
+        <div class="kg-cta-eyebrow">Classification results</div>
+        <div class="kg-cta-title">ECG Case Explorer</div>
+        <div class="kg-cta-meta"><span class="kg-cta-pill built">Live</span><span class="kg-cta-stats">Uses current workspace</span></div>
+      </div>
+      <div class="kg-cta-arrow"><span data-icon="ChevronRight"></span></div>
+    </button>
+    <button id="patientCta" class="kg-cta patient-cta" type="button" aria-label="Open patient view">
+      <div class="kg-cta-icon"><span data-icon="File"></span></div><div class="kg-cta-body"><div class="kg-cta-eyebrow">Interactive demo</div><div class="kg-cta-title">Patient report and Q&A</div><div class="kg-cta-meta"><span class="kg-cta-stats">Local prototype · Not a diagnosis</span></div></div><div class="kg-cta-arrow"><span data-icon="ChevronRight"></span></div>
     </button>
     <section class="panel files-panel">
       <div class="panel-heading">
         <span data-icon="FolderTree"></span>
-        <span>工作区文件</span>
+        <span>Workspace files</span>
       </div>
       <div id="workspacePath" class="workspace-path"></div>
+      <div class="workspace-dataset-control">
+        <label for="workspaceDatasetSelect">Current dataset</label>
+        <select id="workspaceDatasetSelect"></select>
+      </div>
       <form id="uploadForm" class="upload-form">
         <button id="uploadBtn" type="button" class="upload-pick-button">
           <span class="upload-pick-icon" data-icon="Upload"></span>
           <span class="upload-pick-copy">
-            <span class="upload-pick-title">上传参考文件</span>
-            <span class="upload-pick-subtitle">选择一个或多个文件后自动上传</span>
+            <span class="upload-pick-title">Upload reference files</span>
+            <span class="upload-pick-subtitle">Select one or more files to upload</span>
           </span>
         </button>
         <input id="referenceFiles" class="sr-only-file" type="file" multiple />
@@ -429,8 +535,8 @@ app.innerHTML = `
         <button id="rawZipUploadBtn" type="button" class="upload-pick-button">
           <span class="upload-pick-icon" data-icon="HardDriveUpload"></span>
           <span class="upload-pick-copy">
-            <span class="upload-pick-title">导入原始数据压缩包</span>
-            <span class="upload-pick-subtitle">选择 .zip 后自动解压到 data/raw/</span>
+            <span class="upload-pick-title">Import raw dataset ZIP</span>
+            <span class="upload-pick-subtitle">Select a ZIP to extract into data/raw/</span>
           </span>
         </button>
         <input id="rawZipFile" class="sr-only-file" type="file" accept=".zip" />
@@ -442,10 +548,10 @@ app.innerHTML = `
   <dialog id="detailDialog">
     <form method="dialog">
       <header>
-        <h3 id="dialogTitle">详情</h3>
+        <h3 id="dialogTitle">Details</h3>
         <div class="dialog-actions">
-          <button id="deleteReferenceBtn" value="" class="dialog-delete-btn" type="button" hidden><span data-icon="Trash2"></span><span>删除参考文献</span></button>
-          <button value="close" class="icon-btn ghost" type="submit" title="关闭"><span data-icon="X"></span></button>
+          <button id="deleteReferenceBtn" value="" class="dialog-delete-btn" type="button" hidden><span data-icon="Trash2"></span><span>Delete reference</span></button>
+          <button value="close" class="icon-btn ghost" type="submit" title="Close"><span data-icon="X"></span></button>
         </div>
       </header>
       <pre id="dialogBody"></pre>
@@ -510,6 +616,33 @@ const els = {
   chatTopBtn: query<HTMLButtonElement>('#chatTopBtn'),
   knowledgeGraphView: query<HTMLElement>('#knowledgeGraphView'),
   chainSummaryView: query<HTMLElement>('#chainSummaryView'),
+  ecgSamplesView: query<HTMLElement>('#ecgSamplesView'),
+  ecgWorkspaceMeta: query<HTMLElement>('#ecgWorkspaceMeta'),
+  ecgMetricStrip: query<HTMLElement>('#ecgMetricStrip'),
+  ecgDatasetSelect: query<HTMLSelectElement>('#ecgDatasetSelect'),
+  ecgStatusFilter: query<HTMLSelectElement>('#ecgStatusFilter'),
+  ecgLabelFilter: query<HTMLSelectElement>('#ecgLabelFilter'),
+  ecgMatchCount: query<HTMLElement>('#ecgMatchCount'),
+  ecgEmptyState: query<HTMLElement>('#ecgEmptyState'),
+  ecgWorkbench: query<HTMLElement>('#ecgWorkbench'),
+  ecgSampleList: query<HTMLElement>('#ecgSampleList'),
+  ecgWaveformHeading: query<HTMLElement>('#ecgWaveformHeading'),
+  ecgWaveformGrid: query<HTMLElement>('#ecgWaveformGrid'),
+  ecgResultDetail: query<HTMLElement>('#ecgResultDetail'),
+  clinicalReviewPane: query<HTMLElement>('#clinicalReviewPane'),
+  refreshEcgBtn: query<HTMLButtonElement>('#refreshEcgBtn'),
+  openPatientFromEcgBtn: query<HTMLButtonElement>('#openPatientFromEcgBtn'),
+  backToChatFromEcgBtn: query<HTMLButtonElement>('#backToChatFromEcgBtn'),
+  patientView: query<HTMLElement>('#patientView'),
+  patientSampleSelect: query<HTMLSelectElement>('#patientSampleSelect'),
+  patientDatasetName: query<HTMLElement>('#patientDatasetName'),
+  patientEmptyState: query<HTMLElement>('#patientEmptyState'),
+  patientContent: query<HTMLElement>('#patientContent'),
+  patientReportBody: query<HTMLElement>('#patientReportBody'),
+  patientQaMessages: query<HTMLElement>('#patientQaMessages'),
+  patientQaForm: query<HTMLFormElement>('#patientQaForm'),
+  patientQuestion: query<HTMLInputElement>('#patientQuestion'),
+  backToEcgFromPatientBtn: query<HTMLButtonElement>('#backToEcgFromPatientBtn'),
   imageViewerView: query<HTMLElement>('#imageViewerView'),
   imageViewerTitle: query<HTMLElement>('#imageViewerTitle'),
   imageViewerImage: query<HTMLImageElement>('#imageViewerImage'),
@@ -562,6 +695,7 @@ const els = {
   timeline: query('#timeline'),
   workspacePath: query('#workspacePath'),
   fileTree: query('#fileTree'),
+  workspaceDatasetSelect: query<HTMLSelectElement>('#workspaceDatasetSelect'),
   uploadForm: query<HTMLFormElement>('#uploadForm'),
   referenceFiles: query<HTMLInputElement>('#referenceFiles'),
   uploadBtn: query<HTMLButtonElement>('#uploadBtn'),
@@ -574,6 +708,8 @@ const els = {
   chainCta: query<HTMLButtonElement>('#chainCta'),
   chainCtaPill: query<HTMLElement>('#chainCtaPill'),
   chainCtaStats: query<HTMLElement>('#chainCtaStats'),
+  ecgCta: query<HTMLButtonElement>('#ecgCta'),
+  patientCta: query<HTMLButtonElement>('#patientCta'),
   settingsBtn: query<HTMLButtonElement>('#settingsBtn'),
   settingsView: query<HTMLElement>('#settingsView'),
   settingsContent: query<HTMLElement>('#settingsContent'),
@@ -674,7 +810,7 @@ els.continueGraphBtn.addEventListener('click', async () => {
   await postJson('/api/knowledge-graph/continue', {});
 });
 els.pauseGraphBtn.addEventListener('click', async () => {
-  await postJson('/api/knowledge-graph/pause', { reason: '用户从知识图谱页面暂停。' });
+  await postJson('/api/knowledge-graph/pause', { reason: 'User paused from the knowledge graph view.' });
 });
 els.saveGraphLlmBtn.addEventListener('click', async () => {
   await saveKnowledgeGraphLlmConfig();
@@ -702,6 +838,120 @@ els.chainCta.addEventListener('click', async () => {
   resetChainRenderSignatures();
   render();
 });
+els.ecgCta.addEventListener('click', () => {
+  state.view = 'ecgSamples';
+  history.pushState({}, '', '/ecg-samples');
+  render();
+  void loadEcgOverview();
+});
+function openPatientView(ecgId: number | null = null) {
+  if (ecgId !== null) state.patientSampleId = ecgId;
+  state.patientMessages = [];
+  state.view = 'patient';
+  history.pushState({}, '', '/patient');
+  render();
+  void loadPatientOverview();
+}
+els.patientCta.addEventListener('click', () => openPatientView());
+els.openPatientFromEcgBtn.addEventListener('click', () => openPatientView(state.selectedEcgId));
+els.backToEcgFromPatientBtn.addEventListener('click', () => {
+  state.view = 'ecgSamples';
+  history.pushState({}, '', '/ecg-samples');
+  render();
+  void loadEcgOverview();
+});
+els.backToChatFromEcgBtn.addEventListener('click', () => {
+  state.view = 'chat';
+  history.pushState({}, '', '/');
+  render();
+});
+els.refreshEcgBtn.addEventListener('click', () => void loadEcgOverview(true));
+els.workspaceDatasetSelect.addEventListener('change', () => {
+  state.ecgDatasetKey = els.workspaceDatasetSelect.value;
+  state.ecgOverview = null;
+  state.patientOverview = null;
+  state.ecgWaveform = null;
+  state.selectedEcgId = null;
+  renderWorkspaceDatasetControl();
+  if (state.view === 'ecgSamples') void loadEcgOverview(true);
+});
+els.ecgDatasetSelect.addEventListener('change', () => {
+  state.ecgDatasetKey = els.ecgDatasetSelect.value;
+  state.ecgOverview = null;
+  state.patientOverview = null;
+  state.ecgWaveform = null;
+  state.selectedEcgId = null;
+  renderWorkspaceDatasetControl();
+  void loadEcgOverview(true);
+});
+els.ecgStatusFilter.addEventListener('change', () => {
+  state.ecgStatus = els.ecgStatusFilter.value as 'all' | 'errors' | 'correct';
+  void loadEcgOverview(true);
+});
+els.ecgLabelFilter.addEventListener('change', () => {
+  state.ecgLabel = els.ecgLabelFilter.value;
+  void loadEcgOverview(true);
+});
+els.ecgSampleList.addEventListener('click', (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-ecg-id]');
+  if (!button) return;
+  void selectEcgSample(Number(button.dataset.ecgId));
+});
+els.clinicalReviewPane.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const sample = (state.ecgOverview?.samples || []).find((item: JsonMap) => Number(item.ecgId) === state.selectedEcgId);
+  const form = event.target as HTMLFormElement;
+  if (!sample || form.id !== 'clinicalReviewForm') return;
+  const action = (event as SubmitEvent).submitter as HTMLButtonElement | null;
+  const status = action?.dataset.reviewAction === 'approved' ? 'approved' : 'draft';
+  const message = saveClinicalReview(state.ecgDatasetKey, Number(sample.ecgId), form, status);
+  const messageNode = els.clinicalReviewPane.querySelector<HTMLElement>('#clinicalReviewMessage');
+  if (messageNode) messageNode.textContent = message;
+  if (message.startsWith('Review approved in this browser') || message.startsWith('Review draft saved in this browser')) {
+    els.clinicalReviewPane.innerHTML = renderClinicalReview(sample, state.ecgDatasetKey);
+    renderPatientDemo();
+  }
+});
+els.patientSampleSelect.addEventListener('change', () => {
+  state.patientSampleId = Number(els.patientSampleSelect.value);
+  state.patientMessages = [];
+  state.patientQaRequestId += 1;
+  state.patientQaBusy = false;
+  renderPatientDemo();
+});
+els.patientQaForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (state.patientQaBusy) return;
+  const question = els.patientQuestion.value.trim();
+  if (!question) return;
+  const sample = (state.patientOverview?.samples || []).find((item: JsonMap) => Number(item.ecgId) === state.patientSampleId) || null;
+  if (!sample || !state.ecgDatasetKey) return;
+  const history = state.patientMessages.filter((message) => message.source !== 'error' && message.source !== 'safety').slice(-6);
+  const dataset = state.ecgDatasetKey;
+  const ecgId = Number(sample.ecgId);
+  const review = getClinicalReview(dataset, ecgId);
+  const reviewLabels = review?.status === 'approved' ? review.labels : [];
+  const requestId = ++state.patientQaRequestId;
+  state.patientQaBusy = true;
+  state.patientMessages.push({ role: 'user', text: question });
+  els.patientQuestion.value = '';
+  renderPatientMessages();
+  try {
+    const result = await postJson<{ answer: string; source: 'llm' | 'safety' }>('/api/ecg/patient-qa', {
+      dataset, ecgId, question, history, reviewLabels,
+    });
+    if (requestId !== state.patientQaRequestId) return;
+    state.patientMessages.push({ role: 'assistant', text: result.answer, source: result.source });
+  } catch (error) {
+    if (requestId !== state.patientQaRequestId) return;
+    state.patientMessages.push({ role: 'assistant', text: error instanceof Error ? error.message : 'AI answer unavailable. Please try again.', source: 'error' });
+  } finally {
+    if (requestId === state.patientQaRequestId) {
+      state.patientQaBusy = false;
+      renderPatientMessages();
+    }
+  }
+});
 els.backToChatFromChainBtn.addEventListener('click', () => {
   state.view = 'chat';
   history.pushState({}, '', '/');
@@ -726,6 +976,10 @@ window.addEventListener('popstate', () => {
     ? 'knowledgeGraph'
     : path === '/chain-summary'
     ? 'chainSummary'
+    : path === '/ecg-samples'
+    ? 'ecgSamples'
+    : path === '/patient'
+    ? 'patient'
     : path === '/image-viewer'
     ? 'imageViewer'
     : path === '/settings'
@@ -735,6 +989,8 @@ window.addEventListener('popstate', () => {
     ? new URLSearchParams(window.location.search).get('path') || ''
     : state.selectedImagePath;
   render();
+  if (state.view === 'ecgSamples') void loadEcgOverview();
+  if (state.view === 'patient') void loadPatientOverview();
 });
 els.graphExtractionDepthInput.addEventListener('change', async () => {
   await saveGraphExtractionDepth();
@@ -761,11 +1017,11 @@ els.interruptBtn.addEventListener('click', async () => {
   await pauseCurrent(reason || 'User paused from web UI.');
 });
 els.forceStopBtn.addEventListener('click', async () => {
-  if (!confirm('强制停止可能使正在执行的工具结果变为未知。仅在正常暂停长时间无响应时使用。是否继续？')) return;
+  if (!confirm('Force stopping can leave in-progress tool results unknown. Continue only if a normal pause is unresponsive. Continue?')) return;
   await postJson('/api/execution/force-stop', { confirm: true });
 });
 els.resetChatBtn.addEventListener('click', async () => {
-  if (!confirm('这将重置聊天记录和 agent 工作流记忆，但保留 data/raw、references 和已构建的知识图谱。是否继续？')) return;
+  if (!confirm('Reset the conversation and agent workflow memory? Raw data, references, and the knowledge graph will be kept.')) return;
   await runAction(async () => {
     const result = await postJson('/api/debug/clear-logs', { scope: 'chat', confirmReset: true });
     state.pendingParts = [];
@@ -776,8 +1032,8 @@ els.resetChatBtn.addEventListener('click', async () => {
   });
 });
 els.clearAllLogsBtn.addEventListener('click', async () => {
-  if (!confirm('这将重置整个工作区，删除参考资料、知识图谱、日志、运行产物、报告和临时工具。设置中的 API 密钥、接口地址、模型与 k 会保留。是否继续？')) return;
-  const typed = prompt('二次确认：请输入 RESET 来确认重置工作区。');
+  if (!confirm('Reset this entire workspace? This deletes references, the knowledge graph, logs, run artifacts, reports, and temporary tools. API and model settings will be kept.')) return;
+  const typed = prompt('Type RESET to confirm the workspace reset.');
   if (typed !== 'RESET') return;
   await runAction(async () => {
     const result = await postJson('/api/debug/clear-logs', { scope: 'all', confirmReset: true });
@@ -791,8 +1047,8 @@ els.clearAllLogsBtn.addEventListener('click', async () => {
 els.deleteReferenceBtn.addEventListener('click', async () => {
   const path = els.deleteReferenceBtn.dataset.path || '';
   if (!path) return;
-  if (!confirm(`确定删除这篇参考文献吗？\n\n${path}`)) return;
-  const typed = prompt('二次确认：请输入 DELETE 删除该参考文献。');
+  if (!confirm(`Delete this reference document?\n\n${path}`)) return;
+  const typed = prompt('Type DELETE to confirm removal of this reference.');
   if (typed !== 'DELETE') return;
   els.deleteReferenceBtn.disabled = true;
   try {
@@ -800,7 +1056,7 @@ els.deleteReferenceBtn.addEventListener('click', async () => {
     applyBootstrapSnapshot(result.bootstrap);
     els.dialog.close();
   } catch (error) {
-    showDetail('删除失败', { message: error instanceof Error ? error.message : String(error) });
+    showDetail('Delete failed', { message: error instanceof Error ? error.message : String(error) });
   } finally {
     els.deleteReferenceBtn.disabled = false;
   }
@@ -823,7 +1079,7 @@ els.sendForm.addEventListener('submit', async (event) => {
     sourceLabel: 'main',
     pending: true,
   });
-  state.loadingMessage = loadingPart('运行中');
+  state.loadingMessage = loadingPart('Running');
   render();
   await nextPaint();
   await runStreamingAction(async () => {
@@ -872,7 +1128,7 @@ async function uploadRawZipFile() {
       const form = new FormData();
       form.append('file', file);
       const result = await postForm('/api/data/raw/upload-zip', form);
-      showDetail('原始数据压缩包已上传', {
+      showDetail('Raw dataset ZIP uploaded', {
         archive: result.uploaded?.archive,
         targetDir: result.uploaded?.targetDir,
         extractedCount: result.uploaded?.extracted?.length || 0,
@@ -982,7 +1238,7 @@ function applyBootstrapSnapshot(data: Bootstrap) {
   syncRuntimeBusy(data);
   state.pendingParts = reconcilePendingParts(data);
   state.loadingMessage = state.busy
-    ? state.loadingMessage || loadingPart('后端运行中，正在实时接收最新消息')
+    ? state.loadingMessage || loadingPart('Backend running; receiving updates')
     : null;
   render();
   resolveRealtimeWaiters(data);
@@ -1024,14 +1280,14 @@ function render() {
   const executionPhase = String(data.execution?.phase || 'ready');
   const pauseWaiting = executionPhase === 'pausing';
   const activeLabel = pauseWaiting
-    ? `正在安全暂停：${nodeDisplayName(activeNode) || '主会话'}`
+    ? `Pausing: ${nodeDisplayName(activeNode) || 'Main session'}`
     : activeSession?.status === 'paused'
-    ? `已暂停：${nodeDisplayName(activeNode)}`
+    ? `Paused: ${nodeDisplayName(activeNode)}`
     : activeNode && !data.runtime?.running
-      ? `等待恢复：${nodeDisplayName(activeNode)}`
+      ? `Waiting to resume: ${nodeDisplayName(activeNode)}`
       : activeNode
-        ? `执行中：${nodeDisplayName(activeNode)}`
-        : '就绪';
+        ? `Running: ${nodeDisplayName(activeNode)}`
+        : 'Ready';
   const activeTone = pauseWaiting
     ? 'pending'
     : activeSession?.status === 'paused' || (activeNode && !data.runtime?.running)
@@ -1040,9 +1296,9 @@ function render() {
   setHtmlIfChanged(els.statusText, statusPill(activeLabel, activeTone));
   els.pauseWaitHint.hidden = !pauseWaiting;
   els.pauseWaitHint.textContent = pauseWaiting
-    ? '正在等待 DSH 取消当前 turn、收拢子 agent 并完成持久化 checkpoint。'
+    ? 'Waiting for the current turn and subagents to stop and the checkpoint to be saved.'
     : '';
-  els.modeText.textContent = data.dryRun ? `${modeLabel(ws.controlMode || ws.mode)} / 试运行` : modeLabel(ws.controlMode || ws.mode || '-');
+  els.modeText.textContent = data.dryRun ? `${modeLabel(ws.controlMode || ws.mode)} / Dry run` : modeLabel(ws.controlMode || ws.mode || '-');
   setHtmlIfChanged(els.variantText, variantPill(data.variant));
   els.modelText.textContent = data.llmConfig?.config?.model || 'sdk-default';
   setHtmlIfChanged(els.runtimeUvText, runtimePill(data.runtime?.workspaceUv));
@@ -1061,11 +1317,14 @@ function render() {
   renderStable('builder-trace', data.knowledgeGraphParts || [], () => renderBuilderTrace(data.knowledgeGraphParts || []));
   renderKnowledgeGraphTabState();
   renderChainSummary(data);
+  renderEcgSamples();
+  renderPatientDemo();
   renderImageViewer();
   renderStable('settings', [state.view, data.llmConfig, data.knowledgeGraphLlmConfig, data.runtimeSettings], () => renderSettings(data));
   renderViewState();
   renderStable('timeline', data.timeline, () => renderTimeline(data.timeline));
   renderStable('file-tree', data.fileTree, () => renderFileTree(data.fileTree));
+  renderWorkspaceDatasetControl();
   renderStable('runtime-settings', data.runtimeSettings || ws.runtimeSettings, () => renderRuntimeSettings(data.runtimeSettings || ws.runtimeSettings));
   renderKgCta(data);
   renderChainCta(data);
@@ -1117,8 +1376,8 @@ function renderPendingControl(pending: JsonMap | null | undefined) {
 
 function renderTranscriptScope(nodes: JsonMap[]) {
   const options = [
-    { value: 'all', label: '全部记录' },
-    { value: 'main', label: '仅主会话' },
+    { value: 'all', label: 'All activity' },
+    { value: 'main', label: 'Main session only' },
     ...(nodes || []).slice().reverse().map((node) => ({
       value: `node:${node.id}`,
       label: `${nodeDisplayName(node.nodeType)} · ${statusLabel(node.status)} · ${formatTime(node.startedAt)}`,
@@ -1184,7 +1443,7 @@ function renderNodeDetail(specs: JsonMap[], nodes: JsonMap[]) {
   const type = state.selectedNodeType;
   const spec = specs.find((candidate) => candidate.type === type);
   if (!spec) {
-    els.nodeDetail.innerHTML = emptyState('请选择一个 node。', 'Info');
+    els.nodeDetail.innerHTML = emptyState('Select a stage.', 'Info');
     return;
   }
   const sessions = nodes.filter((node) => node.nodeType === type).slice().reverse();
@@ -1195,23 +1454,23 @@ function renderNodeDetail(specs: JsonMap[], nodes: JsonMap[]) {
   els.nodeDetail.innerHTML = `
     <div class="node-detail-title">${escapeHtml(nodeDisplayName(spec.type))}</div>
     <div class="meta">${escapeHtml(nodePurposeText(spec))}</div>
-    <div class="detail-section-title">产物</div>
+    <div class="detail-section-title">Artifacts</div>
     ${produced.length ? `<div class="artifact-list">${produced.map((path) => `
       <button class="artifact-item" data-path="${escapeHtml(path)}"><span data-icon="File"></span><span>${escapeHtml(path)}</span></button>
-    `).join('')}</div>` : emptyState('暂无节点产物。', 'File')}
-    <div class="detail-section-title">执行记录</div>
+    `).join('')}</div>` : emptyState('No stage artifacts.', 'File')}
+    <div class="detail-section-title">Execution history</div>
     ${sessions.length ? `<div class="session-list">${sessions.map((node) => `
       <button class="session-item" data-session="${escapeHtml(node.id)}">
         <span class="session-title">${escapeHtml(statusLabel(node.status))} · ${formatTime(node.startedAt)}</span>
         <span class="meta">${escapeHtml(node.summary || node.rationale || '')}</span>
       </button>
-    `).join('')}</div>` : emptyState('暂无 node session。', 'Activity')}
+    `).join('')}</div>` : emptyState('No stage sessions.', 'Activity')}
   `;
 
   for (const item of els.nodeDetail.querySelectorAll<HTMLElement>('.session-item')) {
     item.addEventListener('click', async () => {
       const log = await fetchJson(`/api/nodes/${item.dataset.session}/log`);
-      showDetail(`节点日志 ${item.dataset.session}`, displaySafeSessionParts(log));
+      showDetail(`Stage log ${item.dataset.session}`, displaySafeSessionParts(log));
     });
   }
   for (const item of els.nodeDetail.querySelectorAll<HTMLElement>('.artifact-item')) {
@@ -1231,8 +1490,8 @@ function renderChat(data: Bootstrap) {
       els.chatStream.innerHTML = `
         <div class="welcome-state">
           <div class="welcome-orbit"><span data-icon="Sparkles"></span></div>
-          <h3>可以开始时间序列任务</h3>
-          <p>发送任务后，任务编排器会读取工作区、规划节点，并把执行过程同步到这里。</p>
+          <h3>Start a time-series task</h3>
+          <p>Send a task to start the workflow. Execution activity will appear here.</p>
         </div>
       `;
       hydrateIcons(els.chatStream);
@@ -1318,23 +1577,23 @@ function renderKgCta(data: Bootstrap) {
   const classes = (graph.nodes || []).length;
   const relations = (graph.edges || []).length;
   let state: 'idle' | 'building' | 'built' | 'failed' = 'idle';
-  let label = '空闲';
+  let label = 'Idle';
   if (build.status === 'failed') {
     state = 'failed';
-    label = '失败';
+    label = 'Failed';
   } else if (running) {
     state = 'building';
-    label = '构建中';
+    label = 'Building';
   } else if (build.status === 'completed' && classes > 0) {
     state = 'built';
-    label = '已构建';
+    label = 'Built';
   }
   els.kgCta.dataset.state = state;
   els.kgCtaPill.textContent = label;
   els.kgCtaPill.className = `kg-cta-pill ${state}`;
   els.kgCtaStats.textContent = classes > 0 || relations > 0
-    ? `${classes} 个概念 · ${relations} 条关系`
-    : '尚未构建';
+    ? `${classes} concepts · ${relations} relations`
+    : 'Not built';
 }
 
 function renderChainCta(data: Bootstrap) {
@@ -1345,16 +1604,16 @@ function renderChainCta(data: Bootstrap) {
   const iterations = Array.isArray(summary.iterations) ? summary.iterations.length : 0;
   const metrics = Array.isArray(summary.metricSeries) ? summary.metricSeries.length : 0;
   let ctaState: 'idle' | 'building' | 'built' | 'failed' = 'idle';
-  let label = '空闲';
+  let label = 'Idle';
   if (build.status === 'failed') {
     ctaState = 'failed';
-    label = '失败';
+    label = 'Failed';
   } else if (running) {
     ctaState = 'building';
-    label = '生成中';
+    label = 'Generating';
   } else if (build.status === 'completed' || iterations > 0 || metrics > 0) {
     ctaState = 'built';
-    label = '可查看';
+    label = 'View';
   }
   els.chainCta.dataset.state = ctaState;
   els.chainCtaPill.textContent = label;
@@ -1363,13 +1622,13 @@ function renderChainCta(data: Bootstrap) {
   const featureCount = Number(featureBuild.featureCount || data.referenceFeatureTool?.featureCount || 0);
   let featureLabel: string | null = null;
   if (featureBuild.status === 'completed' && featureBuild.ready !== false) {
-    featureLabel = `特征：${featureCount}`;
+    featureLabel = `Features: ${featureCount}`;
   } else if (featureBuild.status === 'failed') {
-    featureLabel = '特征：失败';
+    featureLabel = 'Features: failed';
   } else if (data.variant?.capabilities?.referenceFeatureExtractor === false) {
-    featureLabel = `特征：已禁用 · ${data.variant?.id || 'variant'}`;
+    featureLabel = `Features: disabled · ${data.variant?.id || 'variant'}`;
   }
-  const base = iterations || metrics ? `${iterations} 轮迭代 · ${metrics} 个指标` : '尚未生成';
+  const base = iterations || metrics ? `${iterations} iterations · ${metrics} metrics` : 'Not generated';
   els.chainCtaStats.textContent = featureLabel ? `${base} · ${featureLabel}` : base;
 }
 
@@ -1403,19 +1662,19 @@ function renderSettings(data: Bootstrap) {
   const ws = data.state || {};
 
   const workspaceRows = [
-    { label: '流程版本', value: variantPill(data.variant) },
-    { label: '当前节点', value: ws.activeNode
+    { label: 'Workflow variant', value: variantPill(data.variant) },
+    { label: 'Current stage', value: ws.activeNode
       ? `<span class="settings-readout-pill active">${escapeHtml(nodeDisplayName(ws.activeNode))}</span>`
       : `<span class="settings-readout-pill">—</span>` },
-    { label: '控制模式', value: `<span class="settings-readout-pill ${ws.controlMode === 'auto' ? 'active' : ''}">${escapeHtml(modeLabel(ws.controlMode || ws.mode || 'manual'))}</span>` },
-    { label: '试运行', value: data.dryRun
-      ? `<span class="settings-readout-pill active">开启</span>`
-      : `<span class="settings-readout-pill">关闭</span>` },
-    { label: '调试操作', value: data.debugEnabled
-      ? `<span class="settings-readout-pill active">已启用</span>`
-      : `<span class="settings-readout-pill">未启用</span>` },
-    { label: '运行环境', value: runtimePill(data.runtime?.workspaceUv) },
-    { label: '工作区路径', value: `<span class="settings-readout-mono">${escapeHtml(data.runtime?.workspaceUv?.workspace || '')}</span>`, copyable: data.runtime?.workspaceUv?.workspace || '' },
+    { label: 'Control mode', value: `<span class="settings-readout-pill ${ws.controlMode === 'auto' ? 'active' : ''}">${escapeHtml(modeLabel(ws.controlMode || ws.mode || 'manual'))}</span>` },
+    { label: 'Dry run', value: data.dryRun
+      ? `<span class="settings-readout-pill active">On</span>`
+      : `<span class="settings-readout-pill">Off</span>` },
+    { label: 'Debug controls', value: data.debugEnabled
+      ? `<span class="settings-readout-pill active">Enabled</span>`
+      : `<span class="settings-readout-pill">Disabled</span>` },
+    { label: 'Runtime', value: runtimePill(data.runtime?.workspaceUv) },
+    { label: 'Workspace path', value: `<span class="settings-readout-mono">${escapeHtml(data.runtime?.workspaceUv?.workspace || '')}</span>`, copyable: data.runtime?.workspaceUv?.workspace || '' },
   ];
 
   const kOptions = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -1423,32 +1682,32 @@ function renderSettings(data: Bootstrap) {
 
   els.settingsContent.innerHTML = `
     <div class="settings-section">
-      <div class="settings-section-header">工作区</div>
+      <div class="settings-section-header">Workspace</div>
       <div class="settings-card">
         ${workspaceRows.map((row) => `
           <div class="settings-row">
             <div class="settings-row-label">${escapeHtml(row.label)}</div>
-            <div class="settings-row-control">${row.value}${row.copyable ? `<button class="settings-icon-btn" type="button" data-copy="${escapeHtml(row.copyable)}" title="复制"><span data-icon="Archive"></span></button>` : ''}</div>
+            <div class="settings-row-control">${row.value}${row.copyable ? `<button class="settings-icon-btn" type="button" data-copy="${escapeHtml(row.copyable)}" title="Copy"><span data-icon="Archive"></span></button>` : ''}</div>
           </div>
         `).join('')}
         <div class="settings-row">
-          <div class="settings-row-label">详细信息</div>
+          <div class="settings-row-label">Details</div>
           <div class="settings-row-control settings-inline-actions">
-            <button class="settings-secondary-btn" type="button" data-settings-detail="state"><span data-icon="Archive"></span><span>查看状态文件</span></button>
-            <button class="settings-secondary-btn" type="button" data-settings-detail="llm"><span data-icon="Settings2"></span><span>查看模型配置</span></button>
+            <button class="settings-secondary-btn" type="button" data-settings-detail="state"><span data-icon="Archive"></span><span>View state file</span></button>
+            <button class="settings-secondary-btn" type="button" data-settings-detail="llm"><span data-icon="Settings2"></span><span>View model configuration</span></button>
           </div>
         </div>
       </div>
-      <p class="settings-section-foot">这些项目由服务启动参数决定，例如 <code>TS_HARNESS_VARIANT</code>、<code>TS_HARNESS_CONTROL_MODE</code>、<code>TS_HARNESS_DRY_RUN</code> 和 <code>TS_HARNESS_DEBUG</code>。如需修改，请重启服务。</p>
+      <p class="settings-section-foot">These values come from server startup settings such as <code>TS_HARNESS_VARIANT</code>, <code>TS_HARNESS_CONTROL_MODE</code>, <code>TS_HARNESS_DRY_RUN</code>, and <code>TS_HARNESS_DEBUG</code>. Restart the service to change them.</p>
     </div>
 
     <div class="settings-section">
-      <div class="settings-section-header">运行参数</div>
+      <div class="settings-section-header">Runtime parameters</div>
       <div class="settings-card">
         <div class="settings-row">
           <div class="settings-row-label">
-            <div>每轮候选方案数（k）</div>
-            <div class="settings-row-help">迭代求解节点每一轮会并行提出多少个方法候选。</div>
+            <div>Candidates per iteration (k)</div>
+            <div class="settings-row-help">Number of method candidates proposed in each iteration.</div>
           </div>
           <div class="settings-row-control">
             ${segmentedHtml('iterativeK', kOptions.map(String), String(state.settings.iterativeK), (v) => v)}
@@ -1456,8 +1715,8 @@ function renderSettings(data: Bootstrap) {
         </div>
         <div class="settings-row">
           <div class="settings-row-label">
-            <div>知识图谱抽取深度</div>
-            <div class="settings-row-help">参考知识构建器从每个来源向外追踪的层数。</div>
+            <div>Knowledge graph depth</div>
+            <div class="settings-row-help">Number of relationship hops extracted from each reference source.</div>
           </div>
           <div class="settings-row-control">
             ${segmentedHtml('graphDepth', depthOptions.map(String), String(state.settings.graphDepth), (v) => v)}
@@ -1466,8 +1725,8 @@ function renderSettings(data: Bootstrap) {
       </div>
     </div>
 
-    ${renderLlmSection('graph', '知识图谱构建模型', '供参考知识图谱构建器使用。留空时继承主模型配置。')}
-    ${renderLlmSection('main', '主模型', '供编排器和所有节点智能体使用。保存到 <code>&lt;workspace&gt;/config.llm.json</code>，通常在下一条消息后生效。', true)}
+    ${renderLlmSection('graph', 'Knowledge graph model', 'Used by the reference knowledge builder. Leave blank to inherit the primary model.')}
+    ${renderLlmSection('main', 'Primary model', 'Used by the orchestrator and stage agents. Saved to <code>&lt;workspace&gt;/config.llm.json</code>; usually applies to the next message.', true)}
   `;
 
   bindSettingsHandlers();
@@ -1481,17 +1740,17 @@ function renderLlmSection(prefix: 'graph' | 'main', title: string, description: 
   const modelValue = isMain ? s.mainModel : s.graphModel;
   const baseUrlValue = isMain ? s.mainBaseUrl : s.graphBaseUrl;
   const authOptions = [
-    { value: 'manual', label: '手动配置' },
-    { value: 'sdk-default', label: 'SDK 默认' },
+    { value: 'manual', label: 'Manual configuration' },
+    { value: 'sdk-default', label: 'SDK default' },
   ];
   const protocolOptions = [
-    { value: '', label: '自动' },
+    { value: '', label: 'Auto' },
     { value: 'deepseek', label: 'deepseek' },
     { value: 'openai-compat', label: 'openai-compat' },
   ];
-  const modelPlaceholder = isMain ? '例如 deepseek-v4-pro' : '默认继承主模型';
-  const baseUrlPlaceholder = isMain ? 'https://api.deepseek.com' : '默认继承主接口地址';
-  const apiKeyPlaceholder = '留空表示保持当前密钥';
+  const modelPlaceholder = isMain ? 'e.g. deepseek-v4-pro' : 'Inherit primary model';
+  const baseUrlPlaceholder = isMain ? 'https://api.deepseek.com' : 'Inherit primary API URL';
+  const apiKeyPlaceholder = 'Leave blank to keep the current key';
   const saveBtnId = isMain ? 'saveMainLlmBtn' : 'saveGraphLlmBtn2';
   const resetBtnId = isMain ? 'resetMainLlmBtn' : '';
   const modelId = `${prefix}Model`;
@@ -1502,28 +1761,28 @@ function renderLlmSection(prefix: 'graph' | 'main', title: string, description: 
       <div class="settings-section-header">${escapeHtml(title)}</div>
       <div class="settings-card">
         <div class="settings-row">
-          <div class="settings-row-label">认证方式</div>
+          <div class="settings-row-label">Authentication</div>
           <div class="settings-row-control">${segmentedHtml(`${prefix}AuthMode`, authOptions.map((o) => o.value), authValue, (v) => v, authOptions.map((o) => o.label))}</div>
         </div>
         <div class="settings-row">
-          <div class="settings-row-label">接口协议</div>
+          <div class="settings-row-label">API protocol</div>
           <div class="settings-row-control">${segmentedHtml(`${prefix}Protocol`, protocolOptions.map((o) => o.value), protocolValue, (v) => v, protocolOptions.map((o) => o.label))}</div>
         </div>
         <div class="settings-row">
-          <div class="settings-row-label">模型</div>
+          <div class="settings-row-label">Model</div>
           <div class="settings-row-control"><input class="settings-input" type="text" id="${modelId}" value="${escapeHtml(modelValue)}" placeholder="${escapeHtml(modelPlaceholder)}" /></div>
         </div>
         <div class="settings-row">
-          <div class="settings-row-label">接口地址</div>
+          <div class="settings-row-label">API base URL</div>
           <div class="settings-row-control"><input class="settings-input" type="text" id="${baseUrlId}" value="${escapeHtml(baseUrlValue)}" placeholder="${escapeHtml(baseUrlPlaceholder)}" /></div>
         </div>
         <div class="settings-row">
-          <div class="settings-row-label">API 密钥</div>
+          <div class="settings-row-label">API key</div>
           <div class="settings-row-control"><input class="settings-input" type="password" id="${apiKeyId}" value="" placeholder="${escapeHtml(apiKeyPlaceholder)}" autocomplete="off" /></div>
         </div>
         <div class="settings-card-footer">
-          <button id="${saveBtnId}" type="button" class="settings-primary-btn"><span data-icon="Check"></span><span>${escapeHtml(isMain ? '保存主模型' : '保存构建模型')}</span></button>
-          ${isMain ? `<button id="${resetBtnId}" type="button" class="settings-secondary-btn"><span data-icon="RefreshCw"></span><span>恢复文件默认值</span></button>` : ''}
+          <button id="${saveBtnId}" type="button" class="settings-primary-btn"><span data-icon="Check"></span><span>${escapeHtml(isMain ? 'Save primary model' : 'Save graph model')}</span></button>
+          ${isMain ? `<button id="${resetBtnId}" type="button" class="settings-secondary-btn"><span data-icon="RefreshCw"></span><span>Restore file defaults</span></button>` : ''}
           <span class="settings-save-status" id="${prefix}SaveStatus"></span>
         </div>
       </div>
@@ -1586,9 +1845,9 @@ function bindSettingsHandlers() {
   for (const detailBtn of els.settingsContent.querySelectorAll<HTMLButtonElement>('[data-settings-detail]')) {
     detailBtn.addEventListener('click', () => {
       if (detailBtn.dataset.settingsDetail === 'state') {
-        showDetail('工作区状态文件', state.bootstrap?.state);
+        showDetail('Workspace state file', state.bootstrap?.state);
       } else {
-        showDetail('模型配置', state.bootstrap?.llmConfig);
+        showDetail('Model configuration', state.bootstrap?.llmConfig);
       }
     });
   }
@@ -1607,7 +1866,7 @@ function bindSettingsHandlers() {
           hydrateIcons(copyBtn);
         }, 1100);
       } catch (error) {
-        showDetail('复制失败', { message: error instanceof Error ? error.message : String(error) });
+        showDetail('Copy failed', { message: error instanceof Error ? error.message : String(error) });
       }
     });
   }
@@ -1655,7 +1914,7 @@ async function saveLlmConfig(isMain: boolean) {
     }
     const status = els.settingsContent.querySelector<HTMLElement>(statusSelector);
     if (status) {
-      status.textContent = '已保存';
+      status.textContent = 'Saved';
       status.classList.add('saved');
       window.setTimeout(() => {
         status.textContent = '';
@@ -1663,12 +1922,12 @@ async function saveLlmConfig(isMain: boolean) {
       }, 1800);
     }
   } catch (error) {
-    showDetail(isMain ? '保存主模型失败' : '保存构建模型失败', { message: error instanceof Error ? error.message : String(error) });
+    showDetail(isMain ? 'Failed to save primary model' : 'Failed to save graph model', { message: error instanceof Error ? error.message : String(error) });
   }
 }
 
 async function resetMainLlmConfig() {
-  if (!confirm('是否将主模型恢复为文件默认值？这会清空保存在 <workspace>/config.llm.json 中的模型、接口地址和协议设置；API 密钥会保留。')) return;
+  if (!confirm('Restore the primary model from file defaults? This clears the saved model, API URL, and protocol in <workspace>/config.llm.json. The API key will be kept.')) return;
   try {
     const result = await postJson('/api/llm-config', {
       authMode: 'sdk-default',
@@ -1679,25 +1938,272 @@ async function resetMainLlmConfig() {
     syncSettingsFromBootstrap(result.bootstrap);
     applyBootstrapSnapshot(result.bootstrap);
   } catch (error) {
-    showDetail('恢复主模型失败', { message: error instanceof Error ? error.message : String(error) });
+    showDetail('Failed to restore primary model', { message: error instanceof Error ? error.message : String(error) });
   }
+}
+
+async function loadEcgDatasets(force = false) {
+  if (state.ecgDatasets.length && !force) {
+    renderWorkspaceDatasetControl();
+    return;
+  }
+  try {
+    const registry = await fetchJson<JsonMap>('/api/ecg/datasets');
+    state.ecgDatasets = Array.isArray(registry.datasets) ? registry.datasets : [];
+    const available = state.ecgDatasets.some((dataset) => dataset.key === state.ecgDatasetKey);
+    if (!state.ecgDatasetKey || !available) state.ecgDatasetKey = String(registry.selected || state.ecgDatasets[0]?.key || '');
+  } catch (error) {
+    state.ecgError = error instanceof Error ? error.message : String(error);
+  }
+  renderWorkspaceDatasetControl();
+}
+
+async function loadEcgOverview(force = false) {
+  if (state.ecgBusy || (state.ecgOverview && !force)) return;
+  state.ecgBusy = true;
+  state.ecgError = '';
+  renderEcgSamples();
+  const params = new URLSearchParams({ status: state.ecgStatus, limit: '120' });
+  if (state.ecgLabel) params.set('label', state.ecgLabel);
+  try {
+    await loadEcgDatasets(force);
+    if (state.ecgDatasetKey) params.set('dataset', state.ecgDatasetKey);
+    state.ecgOverview = await fetchJson<JsonMap>(`/api/ecg/overview?${params}`);
+    if (!state.ecgDatasetKey && state.ecgOverview.datasetKey) state.ecgDatasetKey = String(state.ecgOverview.datasetKey);
+    const samples = Array.isArray(state.ecgOverview.samples) ? state.ecgOverview.samples : [];
+    const stillAvailable = samples.some((sample: JsonMap) => Number(sample.ecgId) === state.selectedEcgId);
+    state.selectedEcgId = stillAvailable ? state.selectedEcgId : samples[0]?.ecgId ?? null;
+    state.ecgWaveform = null;
+    renderEcgSamples();
+    if (state.selectedEcgId !== null) await selectEcgSample(state.selectedEcgId);
+  } catch (error) {
+    state.ecgOverview = null;
+    state.ecgWaveform = null;
+    state.ecgError = error instanceof Error ? error.message : String(error);
+  } finally {
+    state.ecgBusy = false;
+    renderEcgSamples();
+  }
+}
+
+async function loadPatientOverview(force = false) {
+  if (state.patientBusy || (state.patientOverview && !force)) return;
+  state.patientBusy = true;
+  state.patientError = '';
+  renderPatientDemo();
+  try {
+    await loadEcgDatasets();
+    const params = new URLSearchParams({ status: 'all', limit: '120' });
+    if (state.ecgDatasetKey) params.set('dataset', state.ecgDatasetKey);
+    state.patientOverview = await fetchJson<JsonMap>(`/api/ecg/overview?${params}`);
+    const samples = Array.isArray(state.patientOverview.samples) ? state.patientOverview.samples : [];
+    const pinned = (state.ecgOverview?.samples || []).find((item: JsonMap) => Number(item.ecgId) === state.patientSampleId);
+    if (pinned && !samples.some((item: JsonMap) => Number(item.ecgId) === state.patientSampleId)) samples.unshift(pinned);
+    if (!samples.some((item: JsonMap) => Number(item.ecgId) === state.patientSampleId)) state.patientSampleId = samples[0]?.ecgId ?? null;
+  } catch (error) {
+    state.patientOverview = null;
+    state.patientError = error instanceof Error ? error.message : String(error);
+  } finally {
+    state.patientBusy = false;
+    renderPatientDemo();
+  }
+}
+
+function renderPatientMessages() {
+  els.patientQaMessages.innerHTML = state.patientMessages.length
+    ? state.patientMessages.map((message) => `<div class="patient-message ${message.role}"><span>${message.role === 'user' ? 'Question' : message.source === 'safety' ? 'Safety notice' : message.source === 'error' ? 'Service notice' : 'AI response'}</span><p>${escapeHtml(message.text)}</p></div>`).join('')
+    : '<p class="patient-qa-welcome">Ask about report terms, certainty, or general next steps.</p>';
+  if (state.patientQaBusy) els.patientQaMessages.insertAdjacentHTML('beforeend', '<div class="patient-message assistant" role="status"><span>AI response</span><p>Thinking...</p></div>');
+  els.patientQuestion.disabled = state.patientQaBusy;
+  const submit = els.patientQaForm.querySelector<HTMLButtonElement>('button[type="submit"]');
+  if (submit) submit.disabled = state.patientQaBusy;
+  els.patientQaMessages.scrollTop = els.patientQaMessages.scrollHeight;
+}
+
+function renderPatientDemo() {
+  if (state.view !== 'patient') return;
+  const overview = state.patientOverview;
+  const samples = Array.isArray(overview?.samples) ? overview.samples : [];
+  const sample = samples.find((item: JsonMap) => Number(item.ecgId) === state.patientSampleId) || null;
+  els.patientDatasetName.textContent = overview?.datasetName || '';
+  els.patientSampleSelect.innerHTML = samples.map((item: JsonMap) => `<option value="${Number(item.ecgId)}">Demo case ${Number(item.ecgId)}</option>`).join('');
+  if (sample) els.patientSampleSelect.value = String(sample.ecgId);
+  els.patientSampleSelect.disabled = !samples.length;
+  els.patientEmptyState.hidden = Boolean(sample);
+  els.patientContent.hidden = !sample;
+  if (!sample) {
+    els.patientEmptyState.textContent = state.patientBusy ? 'Loading demo cases…' : state.patientError || 'No cases are available.';
+    return;
+  }
+  els.patientReportBody.innerHTML = renderPatientReport(sample, state.ecgDatasetKey);
+  renderPatientMessages();
+}
+
+async function selectEcgSample(ecgId: number) {
+  state.selectedEcgId = ecgId;
+  state.ecgWaveform = null;
+  state.ecgError = '';
+  renderEcgSamples();
+  try {
+    const params = new URLSearchParams();
+    if (state.ecgDatasetKey) params.set('dataset', state.ecgDatasetKey);
+    state.ecgWaveform = await fetchJson<JsonMap>(`/api/ecg/samples/${ecgId}/waveform?${params}`);
+  } catch (error) {
+    state.ecgError = error instanceof Error ? error.message : String(error);
+  }
+  renderEcgSamples();
+}
+
+function renderEcgSamples() {
+  if (state.view !== 'ecgSamples') return;
+  els.ecgStatusFilter.value = state.ecgStatus;
+  els.ecgLabelFilter.value = state.ecgLabel;
+  els.refreshEcgBtn.disabled = state.ecgBusy;
+  els.ecgDatasetSelect.innerHTML = state.ecgDatasets.map((dataset: JsonMap) => {
+    const detail = dataset.iteration ? ` · iteration ${escapeHtml(dataset.iteration)}` : '';
+    return `<option value="${escapeHtml(dataset.key)}">${escapeHtml(dataset.name || dataset.key)}${detail}</option>`;
+  }).join('');
+  if (state.ecgDatasetKey) els.ecgDatasetSelect.value = state.ecgDatasetKey;
+  els.ecgDatasetSelect.disabled = state.ecgBusy || state.ecgDatasets.length <= 1;
+  const overview = state.ecgOverview;
+  if (!overview) {
+    els.ecgWorkbench.hidden = true;
+    els.ecgMetricStrip.innerHTML = '';
+    els.ecgMatchCount.textContent = '';
+    els.ecgEmptyState.hidden = false;
+    els.ecgEmptyState.innerHTML = state.ecgBusy
+      ? '<span data-icon="Loader2" class="spinning"></span><strong>Loading the latest complete run</strong>'
+      : `<span data-icon="AlertTriangle"></span><div><strong>ECG cases are unavailable</strong><p>${escapeHtml(state.ecgError || 'This workspace has no complete metrics and prediction artifacts.')}</p></div>`;
+    hydrateIcons(els.ecgEmptyState);
+    return;
+  }
+
+  els.ecgWorkspaceMeta.textContent = `${overview.datasetName || 'Current dataset'} · iteration ${overview.iteration} · ${overview.split} · ${overview.sampleCount} records`;
+  els.ecgMetricStrip.innerHTML = (overview.classes || []).map((metric: JsonMap) => `
+    <article class="ecg-class-metric">
+      <div class="ecg-class-name">${escapeHtml(metric.class)}</div>
+      <strong>${formatPercent(metric.f1)}</strong>
+      <span>F1</span>
+      <dl><dt>Cases</dt><dd>${escapeHtml(metric.support_true)}</dd><dt>Missed</dt><dd>${escapeHtml(metric.FN)}</dd><dt>Recall</dt><dd>${formatPercent(metric.recall)}</dd></dl>
+    </article>
+  `).join('');
+  const samples = Array.isArray(overview.samples) ? overview.samples : [];
+  els.ecgMatchCount.textContent = `${overview.matchedCount} matching · ${samples.length} shown`;
+  els.ecgEmptyState.hidden = samples.length > 0;
+  els.ecgWorkbench.hidden = samples.length === 0;
+  if (!samples.length) {
+    els.ecgEmptyState.innerHTML = '<span data-icon="Info"></span><strong>No cases match these filters</strong>';
+    hydrateIcons(els.ecgEmptyState);
+    return;
+  }
+
+  els.ecgSampleList.innerHTML = samples.map((sample: JsonMap) => {
+    const selected = Number(sample.ecgId) === state.selectedEcgId ? ' selected' : '';
+    const truth = sample.truth?.join(' + ') || 'NONE';
+    const predicted = sample.predicted?.join(' + ') || 'NONE';
+    return `<button type="button" class="ecg-sample-row${selected}" data-ecg-id="${escapeHtml(sample.ecgId)}">
+      <span class="ecg-sample-id">ECG ${escapeHtml(sample.ecgId)}</span>
+      <span class="ecg-sample-route"><b>${escapeHtml(truth)}</b><i>→</i><b>${escapeHtml(predicted)}</b></span>
+      <span class="ecg-sample-meta">Age ${escapeHtml(sample.age ?? 'unknown')} · ${escapeHtml(sample.sex === '男' ? 'Male' : sample.sex === '女' ? 'Female' : 'Unknown')} · ${escapeHtml(sample.subclasses?.join(', ') || 'No subclass')}</span>
+    </button>`;
+  }).join('');
+
+  const sample = samples.find((item: JsonMap) => Number(item.ecgId) === state.selectedEcgId) || samples[0];
+  renderEcgResult(sample, overview.thresholds || {});
+  const reviewKey = `${state.ecgDatasetKey}:${overview.iteration}:${sample.ecgId}`;
+  if (els.clinicalReviewPane.dataset.sampleKey !== reviewKey) {
+    els.clinicalReviewPane.innerHTML = renderClinicalReview(sample, state.ecgDatasetKey);
+    els.clinicalReviewPane.dataset.sampleKey = reviewKey;
+  }
+  renderEcgWaveform(sample);
+}
+
+function renderEcgResult(sample: JsonMap, thresholds: JsonMap) {
+  const truth = sample.truth || [];
+  const predicted = sample.predicted || [];
+  const labels = ['NORM', 'MI', 'STTC', 'CD', 'HYP'];
+  const outcome = sample.exact
+    ? '<span class="ecg-outcome correct">Exact match</span>'
+    : `<span class="ecg-outcome error">${sample.missed?.length ? `Missed ${escapeHtml(sample.missed.join(', '))}` : ''}${sample.missed?.length && sample.added?.length ? ' · ' : ''}${sample.added?.length ? `Extra ${escapeHtml(sample.added.join(', '))}` : ''}</span>`;
+  els.ecgResultDetail.innerHTML = `
+    <div class="ecg-result-summary">
+      ${outcome}
+      <div><span>Reference labels</span><strong>${escapeHtml(truth.join(' + ') || 'NONE')}</strong></div>
+      <div><span>Predicted labels</span><strong>${escapeHtml(predicted.join(' + ') || 'NONE')}</strong></div>
+    </div>
+    <div class="ecg-probabilities">
+      ${labels.map((label) => {
+        const score = Number(sample.scores?.[label] || 0);
+        const threshold = Number(thresholds[label] || 0.5);
+        const thresholdLeft = Math.max(0, Math.min(100, threshold * 100));
+        return `<div class="ecg-probability-row ${predicted.includes(label) ? 'positive' : ''}">
+          <div><strong>${label}</strong><span>${score.toFixed(3)} / threshold ${threshold.toFixed(3)}</span></div>
+          <div class="ecg-probability-track"><span style="width:${Math.max(0, Math.min(100, score * 100))}%"></span><i style="left:${thresholdLeft}%"></i></div>
+        </div>`;
+      }).join('')}
+    </div>
+    <div class="ecg-result-note">Scores and thresholds come from this iteration's validation results. The waveform supports case inspection, not a clinical diagnosis.</div>
+  `;
+}
+
+function renderEcgWaveform(sample: JsonMap) {
+  els.ecgWaveformHeading.textContent = `12-lead ECG · ECG ${sample.ecgId}`;
+  if (!state.ecgWaveform || Number(state.ecgWaveform.ecgId) !== Number(sample.ecgId)) {
+    els.ecgWaveformGrid.innerHTML = state.ecgError
+      ? `<div class="ecg-waveform-message"><span data-icon="AlertTriangle"></span>${escapeHtml(state.ecgError)}</div>`
+      : '<div class="ecg-waveform-message"><span data-icon="Loader2" class="spinning"></span>Loading recorded WFDB waveform</div>';
+    hydrateIcons(els.ecgWaveformGrid);
+    return;
+  }
+  const duration = Number(state.ecgWaveform.durationSeconds || 10);
+  els.ecgWaveformGrid.innerHTML = (state.ecgWaveform.leads || []).map((lead: JsonMap) => {
+    const values = Array.isArray(lead.values) ? lead.values.map(Number) : [];
+    const width = 900;
+    const height = 118;
+    const amplitude = Math.max(1.4, ...values.map((value: number) => Math.abs(value)));
+    const scale = (height * 0.42) / amplitude;
+    const path = values.map((value: number, index: number) => {
+      const x = values.length <= 1 ? 0 : (index / (values.length - 1)) * width;
+      const y = height / 2 - value * scale;
+      return `${index ? 'L' : 'M'}${x.toFixed(2)},${y.toFixed(2)}`;
+    }).join(' ');
+    return `<figure class="ecg-lead">
+      <figcaption>${escapeHtml(lead.name)}</figcaption>
+      <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Lead ${escapeHtml(lead.name)}, ${duration} seconds of recorded ECG">
+        <defs><pattern id="ecgSmallGrid-${escapeHtml(lead.name)}" width="18" height="18" patternUnits="userSpaceOnUse"><path d="M 18 0 L 0 0 0 18" fill="none" stroke="#f3d9dc" stroke-width="0.7"/></pattern><pattern id="ecgGrid-${escapeHtml(lead.name)}" width="90" height="90" patternUnits="userSpaceOnUse"><rect width="90" height="90" fill="url(#ecgSmallGrid-${escapeHtml(lead.name)})"/><path d="M 90 0 L 0 0 0 90" fill="none" stroke="#e9b8be" stroke-width="1"/></pattern></defs>
+        <rect width="100%" height="100%" fill="url(#ecgGrid-${escapeHtml(lead.name)})"/>
+        <path d="${path}" fill="none" stroke="#17252f" stroke-width="1.35" vector-effect="non-scaling-stroke"/>
+      </svg>
+    </figure>`;
+  }).join('');
+}
+
+function formatPercent(value: any) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${(number * 100).toFixed(1)}%` : '-';
 }
 
 function renderViewState() {
   const graphMode = state.view === 'knowledgeGraph';
   const chainMode = state.view === 'chainSummary';
+  const ecgMode = state.view === 'ecgSamples';
+  const patientMode = state.view === 'patient';
   const imageMode = state.view === 'imageViewer';
   const settingsMode = state.view === 'settings';
-  els.chatStream.hidden = graphMode || chainMode || imageMode || settingsMode;
+  els.chatStream.hidden = graphMode || chainMode || ecgMode || patientMode || imageMode || settingsMode;
   els.knowledgeGraphView.hidden = !graphMode;
   els.chainSummaryView.hidden = !chainMode;
+  els.ecgSamplesView.hidden = !ecgMode;
+  els.patientView.hidden = !patientMode;
   els.imageViewerView.hidden = !imageMode;
   els.settingsView.hidden = !settingsMode;
-  els.sendForm.hidden = graphMode || chainMode || imageMode || settingsMode;
-  els.transcriptScope.disabled = graphMode || chainMode || imageMode;
-  query('#mainTitle').textContent = graphMode ? '知识图谱' : chainMode ? '思维链总结' : imageMode ? '图片查看' : settingsMode ? '设置' : '任务编排';
+  els.sendForm.hidden = graphMode || chainMode || ecgMode || patientMode || imageMode || settingsMode;
+  els.transcriptScope.disabled = graphMode || chainMode || ecgMode || patientMode || imageMode;
+  query('#mainTitle').textContent = graphMode ? 'Knowledge graph' : chainMode ? 'Workflow summary' : ecgMode ? 'ECG Case Explorer' : patientMode ? 'Patient view' : imageMode ? 'Image viewer' : settingsMode ? 'Settings' : 'Task orchestration';
   document.body.classList.toggle('knowledge-page', graphMode);
   document.body.classList.toggle('chain-page', chainMode);
+  document.body.classList.toggle('ecg-page', ecgMode);
+  document.body.classList.toggle('patient-page', patientMode);
   document.body.classList.toggle('image-page', imageMode);
   document.body.classList.toggle('settings-page', settingsMode);
   updateChatTopButton();
@@ -1727,7 +2233,7 @@ function renderGraphInfoState() {
   els.graphLayout.classList.toggle('info-collapsed', state.graphInfoCollapsed);
   els.graphInfoPanel.hidden = state.graphInfoCollapsed;
   els.graphInfoToggle.hidden = false;
-  els.graphInfoToggle.title = state.graphInfoCollapsed ? '展开图谱信息' : '折叠图谱信息';
+  els.graphInfoToggle.title = state.graphInfoCollapsed ? 'Expand graph details' : 'Collapse graph details';
   els.graphInfoToggle.setAttribute('aria-label', els.graphInfoToggle.title);
 }
 
@@ -1756,14 +2262,14 @@ function renderChainSummary(data: Bootstrap) {
     <div class="chain-status-main">
       <span class="mini-pill ${build.status === 'failed' ? 'failed' : running ? 'active' : build.status === 'completed' ? 'ready' : 'pending'}">
         ${running ? '<span data-icon="Loader2"></span>' : ''}
-        ${escapeHtml(running ? '运行中' : statusLabel(build.status || 'idle'))}
+        ${escapeHtml(running ? 'Running' : statusLabel(build.status || 'idle'))}
       </span>
-      <span class="meta">${escapeHtml(chainSummaryBuildMessage(build.message || '') || '流程总结会读取当前工作区的日志和产物。')}</span>
+      <span class="meta">${escapeHtml(chainSummaryBuildMessage(build.message || '') || 'The workflow summary reads logs and artifacts from this workspace.')}</span>
     </div>
     <div class="chain-status-stats">
-      <span><strong>${escapeHtml(iterations)}</strong><small>迭代</small></span>
-      <span><strong>${escapeHtml(metrics)}</strong><small>指标</small></span>
-      <span><strong>${escapeHtml(samples)}</strong><small>样本</small></span>
+      <span><strong>${escapeHtml(iterations)}</strong><small>Iteration</small></span>
+      <span><strong>${escapeHtml(metrics)}</strong><small>metrics</small></span>
+      <span><strong>${escapeHtml(samples)}</strong><small>Cases</small></span>
     </div>
   `;
   }
@@ -1793,12 +2299,12 @@ function renderChainNav(summary: JsonMap, build: JsonMap = {}) {
   const iterations: JsonMap[] = Array.isArray(summary.iterations) ? summary.iterations : [];
   const generated = build.status === 'completed' || Boolean(summary.overview) || iterations.length > 0;
   const links = [
-    { target: 'chainBuildStatus', label: '状态概览', icon: 'Activity' },
-    { target: 'chain-metrics-section', label: '指标变化', icon: 'Gauge' },
-    ...(generated ? [{ target: 'chain-overview-section', label: '总结摘要', icon: 'Sparkles' }] : []),
+    { target: 'chainBuildStatus', label: 'Status overview', icon: 'Activity' },
+    { target: 'chain-metrics-section', label: 'Metric changes', icon: 'Gauge' },
+    ...(generated ? [{ target: 'chain-overview-section', label: 'Summary overview', icon: 'Sparkles' }] : []),
     ...iterations.map((iteration, index) => ({
       target: `chain-iteration-${index + 1}`,
-      label: `第 ${iterationAxisLabel(iteration.iterationId || index + 1, index)} 轮`,
+      label: `Round ${iterationAxisLabel(iteration.iterationId || index + 1, index)}`,
       icon: 'GitBranch',
     })),
   ];
@@ -1821,7 +2327,7 @@ function renderChainNav(summary: JsonMap, build: JsonMap = {}) {
 function renderChainNavState() {
   els.chainBody.classList.toggle('nav-collapsed', state.chainNavCollapsed);
   els.chainNav.hidden = state.chainNavCollapsed;
-  els.chainNavToggle.title = state.chainNavCollapsed ? '展开目录' : '折叠目录';
+  els.chainNavToggle.title = state.chainNavCollapsed ? 'Expand contents' : 'Collapse contents';
   els.chainNavToggle.setAttribute('aria-label', els.chainNavToggle.title);
 }
 
@@ -1830,11 +2336,11 @@ function renderChainMetricChart(series: JsonMap[]) {
     Array.isArray(item.values) && item.values.some((value: JsonMap) => Number.isFinite(Number(value.value)))
   );
   if (!cleaned.length) {
-    els.chainMetricChart.innerHTML = emptyState('生成后将在这里展示多个关键指标随 iteration 的变化。', 'Activity');
+    els.chainMetricChart.innerHTML = emptyState('Key metrics across iterations will appear here.', 'Activity');
     return;
   }
   els.chainMetricChart.innerHTML = `
-    <div id="chain-metrics-section" class="panel-heading chain-anchor"><span data-icon="Activity"></span><span>指标随迭代变化</span></div>
+    <div id="chain-metrics-section" class="panel-heading chain-anchor"><span data-icon="Activity"></span><span>Metrics across iterations</span></div>
     <div class="metric-chart-grid">
       ${cleaned.map(metricChartHtml).join('')}
     </div>
@@ -1940,26 +2446,26 @@ function renderChainContent(summary: JsonMap, build: JsonMap = {}) {
     els.chainSummaryContent.innerHTML = `
       <div class="chain-placeholder">
         <span data-icon="Activity"></span>
-        <h3>等待生成思维链总结</h3>
-        <p>${escapeHtml(build.status === 'failed' ? chainSummaryBuildMessage(build.message || '') || '生成失败，请检查流程总结构建日志。' : '点击上方按钮后，流程总结构建器会读取当前工作区的日志、报告、运行记录和样本可视化，生成完整决策链。')}</p>
+        <h3>Awaiting workflow summary</h3>
+        <p>${escapeHtml(build.status === 'failed' ? chainSummaryBuildMessage(build.message || '') || 'Generation failed. Check the build log.' : 'Generate a summary from the workspace logs, reports, run records, and case visualizations.')}</p>
       </div>
     `;
     return;
   }
   if (!iterations.length && !summary.overview) {
-    els.chainSummaryContent.innerHTML = emptyState('流程总结构建器已完成，但没有可展示的总结内容。', 'Info');
+    els.chainSummaryContent.innerHTML = emptyState('The workflow summary has no displayable content.', 'Info');
     return;
   }
   els.chainSummaryContent.innerHTML = `
     <article id="chain-overview-section" class="chain-overview chain-anchor">
       <header class="chain-overview-head">
-        <div class="panel-heading"><span data-icon="Sparkles"></span><span>${escapeHtml(summary.title || '思维链总结')}</span></div>
-        ${summary.generatedAt ? `<div class="meta">生成时间 ${escapeHtml(formatTime(summary.generatedAt))}</div>` : ''}
+        <div class="panel-heading"><span data-icon="Sparkles"></span><span>${escapeHtml(summary.title || 'Workflow summary')}</span></div>
+        ${summary.generatedAt ? `<div class="meta">Generated ${escapeHtml(formatTime(summary.generatedAt))}</div>` : ''}
       </header>
       <div class="markdown-body chain-overview-body">${renderMarkdown(summary.overview || '')}</div>
       ${Array.isArray(summary.uncertainty) && summary.uncertainty.length ? `
         <details class="chain-uncertainty">
-          <summary><span data-icon="AlertTriangle"></span><span>风险与信息缺口</span><span class="chain-warning-count">${summary.uncertainty.length}</span></summary>
+          <summary><span data-icon="AlertTriangle"></span><span>Risks and missing evidence</span><span class="chain-warning-count">${summary.uncertainty.length}</span></summary>
           <div class="chain-uncertainty-list">
             ${summary.uncertainty.map((item: any) => `<span><span data-icon="AlertTriangle"></span>${escapeHtml(item)}</span>`).join('')}
           </div>
@@ -1986,21 +2492,21 @@ function chainIterationHtml(iteration: JsonMap, index: number, total: number) {
   return `
     <article id="chain-iteration-${index + 1}" class="chain-iteration-card chain-anchor">
       <header class="chain-iteration-head">
-        <div class="chain-iteration-id"><span>迭代</span>${escapeHtml(iteration.iterationId || 'iteration')}</div>
+        <div class="chain-iteration-id"><span>Iteration</span>${escapeHtml(iteration.iterationId || 'iteration')}</div>
       </header>
       <section class="chain-card-section">
-      <div class="detail-section-title"><span class="chain-section-index">1</span><span>提出方法</span></div>
-      ${methodRows.length ? `<div class="chain-method-result-list">${methodRows.map(methodResultRowHtml).join('')}</div>` : emptyState('没有可审计的方法与测试结果记录。', 'Info')}
+      <div class="detail-section-title"><span class="chain-section-index">1</span><span>Proposed methods</span></div>
+      ${methodRows.length ? `<div class="chain-method-result-list">${methodRows.map(methodResultRowHtml).join('')}</div>` : emptyState('No auditable method or test result recorded.', 'Info')}
       </section>
       <section class="chain-card-section">
-      <div class="detail-section-title"><span class="chain-section-index">2</span><span>样本启发</span></div>
-      ${samples.length ? `<div class="chain-samples">${samples.map(chainSampleHtml).join('')}</div>` : emptyState('没有记录样本级启发。', 'Info')}
+      <div class="detail-section-title"><span class="chain-section-index">2</span><span>Case insights</span></div>
+      ${samples.length ? `<div class="chain-samples">${samples.map(chainSampleHtml).join('')}</div>` : emptyState('No case-level insight recorded.', 'Info')}
       </section>
       ${nextDecisionHtml(iteration.nextDecision || { decision: iteration.nextStep || '' })}
     </article>
     ${index < total - 1 ? `
-      <div class="chain-transition-arrow" aria-label="该决策指导下一轮提出方法">
-        <span>该决策指导下一轮提出方法</span>
+      <div class="chain-transition-arrow" aria-label="This decision guides the next candidates">
+        <span>This decision guides the next candidates</span>
         <span data-icon="ArrowDown"></span>
       </div>
     ` : ''}
@@ -2012,41 +2518,41 @@ function nextDecisionHtml(decision: JsonMap) {
   const actions: JsonMap[] = Array.isArray(decision.actions) ? decision.actions : [];
   return `
     <section class="chain-card-section chain-next-decision">
-      <div class="detail-section-title"><span class="chain-section-index">3</span><span>下轮决策</span><span class="chain-core-label">思维链核心</span></div>
-      <p class="chain-decision-lead">${escapeHtml(decision.decision || '没有记录下轮决策。')}</p>
+      <div class="detail-section-title"><span class="chain-section-index">3</span><span>Next iteration decision</span><span class="chain-core-label">Decision rationale</span></div>
+      <p class="chain-decision-lead">${escapeHtml(decision.decision || 'No next-iteration decision recorded.')}</p>
       ${decision.iterationEvidence ? `
         <div class="chain-decision-evidence">
-          <strong>本轮证据</strong>
+          <strong>Evidence this round</strong>
           <p>${escapeHtml(decision.iterationEvidence)}</p>
         </div>
       ` : ''}
-      <div class="chain-decision-subtitle">领域知识如何指导决策</div>
+      <div class="chain-decision-subtitle">How domain knowledge guided the decision</div>
       ${knowledge.length ? `
         <div class="chain-knowledge-list">
           ${knowledge.map((item, knowledgeIndex) => `
             <article class="chain-knowledge-item">
               <span class="chain-knowledge-index">K${knowledgeIndex + 1}</span>
               <div>
-                <strong>${escapeHtml(item.knowledge || '未命名领域知识')}</strong>
+                <strong>${escapeHtml(item.knowledge || 'Unnamed domain knowledge')}</strong>
                 <p>${escapeHtml(item.guidance || '')}</p>
                 ${item.sourcePath ? `<button type="button" class="artifact-item" data-chain-path="${escapeHtml(item.sourcePath)}"><span data-icon="File"></span><span>${escapeHtml(item.sourcePath)}</span></button>` : ''}
               </div>
             </article>
           `).join('')}
         </div>
-      ` : `<div class="chain-decision-missing">${decision.legacy ? '这是旧版报告，未记录领域知识与决策的映射。请重新生成思维链总结。' : '未记录领域知识与决策的映射。'}</div>`}
-      <div class="chain-decision-subtitle">下一轮执行与验证</div>
+      ` : `<div class="chain-decision-missing">${decision.legacy ? 'This older report does not connect domain knowledge to decisions. Regenerate the workflow summary.' : 'No mapping from domain knowledge to the decision was recorded.'}</div>`}
+      <div class="chain-decision-subtitle">Next actions and validation</div>
       ${actions.length ? `
         <div class="chain-action-list">
           ${actions.map((item, actionIndex) => `
             <article class="chain-action-item">
-              <strong>${actionIndex + 1}. ${escapeHtml(item.action || '未命名动作')}</strong>
-              <p><span>预期效果</span>${escapeHtml(item.expectedEffect || '')}</p>
-              <p><span>验证方式</span>${escapeHtml(item.validation || '')}</p>
+              <strong>${actionIndex + 1}. ${escapeHtml(item.action || 'Unnamed action')}</strong>
+              <p><span>Expected effect</span>${escapeHtml(item.expectedEffect || '')}</p>
+              <p><span>Validation</span>${escapeHtml(item.validation || '')}</p>
             </article>
           `).join('')}
         </div>
-      ` : `<div class="chain-decision-missing">未记录可执行且可验证的下一轮计划。</div>`}
+      ` : `<div class="chain-decision-missing">No executable, testable next-step plan recorded.</div>`}
     </section>
   `;
 }
@@ -2075,13 +2581,13 @@ function methodResultRowHtml(row: { method: JsonMap; result: JsonMap; index: num
   return `
     <div class="chain-method-result-row">
       <section class="chain-mini-card chain-method-card">
-        <div class="chain-card-eyebrow">Candidate ${row.index + 1} · 方法</div>
+        <div class="chain-card-eyebrow">Candidate ${row.index + 1} · Method</div>
         <strong>${escapeHtml(methodName)}</strong>
         <p>${escapeHtml(method.hypothesis || '')}</p>
         ${method.artifactPath ? `<button type="button" class="artifact-item" data-chain-path="${escapeHtml(method.artifactPath)}"><span data-icon="File"></span><span>${escapeHtml(method.artifactPath)}</span></button>` : ''}
       </section>
       <section class="chain-mini-card chain-result-card">
-        <div class="chain-card-eyebrow">Candidate ${row.index + 1} · 测试结果</div>
+        <div class="chain-card-eyebrow">Candidate ${row.index + 1} · Test result</div>
         <strong>${escapeHtml(metric)}${result.value ? `: ${escapeHtml(result.value)}` : ''}</strong>
         <p>${escapeHtml(result.interpretation || '')}</p>
         ${result.evidencePath ? `<button type="button" class="artifact-item" data-chain-path="${escapeHtml(result.evidencePath)}"><span data-icon="File"></span><span>${escapeHtml(result.evidencePath)}</span></button>` : ''}
@@ -2094,7 +2600,7 @@ function chainSampleHtml(sample: JsonMap) {
   const path = String(sample.visualizationPath || '').trim();
   const previewable = isPreviewableImage(path);
   const image = previewable
-    ? `<button type="button" class="chain-sample-image-button" data-chain-image="${escapeHtml(path)}" aria-label="查看 ${escapeHtml(sample.sampleId || 'sample visualization')}"><img src="/api/files/preview?path=${encodeURIComponent(path)}" alt="${escapeHtml(sample.sampleId || 'sample visualization')}" loading="lazy" /></button>`
+    ? `<button type="button" class="chain-sample-image-button" data-chain-image="${escapeHtml(path)}" aria-label="View ${escapeHtml(sample.sampleId || 'sample visualization')}"><img src="/api/files/preview?path=${encodeURIComponent(path)}" alt="${escapeHtml(sample.sampleId || 'sample visualization')}" loading="lazy" /></button>`
     : '';
   return `
     <article class="chain-sample-card">
@@ -2103,12 +2609,12 @@ function chainSampleHtml(sample: JsonMap) {
         <div class="chain-sample-title">${escapeHtml(sample.sampleId || 'sample')}</div>
         ${path ? `<button type="button" class="artifact-item" ${previewable ? `data-chain-image="${escapeHtml(path)}"` : `data-chain-path="${escapeHtml(path)}"`}><span data-icon="File"></span><span>${escapeHtml(path)}</span></button>` : ''}
         <section class="chain-sample-note">
-          <span>描述</span>
-          <p>${escapeHtml(sample.interpretation || '没有记录样本描述。')}</p>
+          <span>Description</span>
+          <p>${escapeHtml(sample.interpretation || 'No case description recorded.')}</p>
         </section>
         <section class="chain-sample-note impact">
-          <span>启发</span>
-          <p>${escapeHtml(sample.nextIterationImpact || '没有记录对下一轮的启发。')}</p>
+          <span>Insight</span>
+          <p>${escapeHtml(sample.nextIterationImpact || 'No next-step insight recorded.')}</p>
         </section>
       </div>
     </article>
@@ -2127,13 +2633,13 @@ function openChainImage(path: string) {
 function renderImageViewer() {
   const path = String(state.selectedImagePath || '').trim();
   if (!path) {
-    els.imageViewerTitle.textContent = '未选择图片';
+    els.imageViewerTitle.textContent = 'No image selected';
     els.imageViewerImage.removeAttribute('src');
     els.imageViewerImage.hidden = true;
     els.imageViewerPath.textContent = '';
     return;
   }
-  els.imageViewerTitle.textContent = path.split('/').pop() || '样本可视化';
+  els.imageViewerTitle.textContent = path.split('/').pop() || 'Case visualization';
   els.imageViewerImage.src = `/api/files/preview?path=${encodeURIComponent(path)}`;
   els.imageViewerImage.alt = path;
   els.imageViewerImage.hidden = false;
@@ -2150,7 +2656,7 @@ function renderKnowledgeGraphBuilder(data: Bootstrap) {
   els.graphBuildStatus.innerHTML = `
     <span class="mini-pill ${build.status === 'failed' ? 'failed' : running ? 'active' : build.status === 'completed' ? 'ready' : 'pending'}">
       ${running ? '<span data-icon="Loader2"></span>' : ''}
-      ${escapeHtml(!knowledgeEnabled ? `已禁用 · ${data.variant?.id || 'variant'}` : running ? '运行中' : statusLabel(build.status || 'idle'))}
+      ${escapeHtml(!knowledgeEnabled ? `Disabled · ${data.variant?.id || 'variant'}` : running ? 'Running' : statusLabel(build.status || 'idle'))}
     </span>
     <span class="meta">${escapeHtml(graphBuildMessage(build.message || ''))}</span>
   `;
@@ -2158,7 +2664,7 @@ function renderKnowledgeGraphBuilder(data: Bootstrap) {
   if (els.graphProtocol.value !== (config.protocol || '')) els.graphProtocol.value = config.protocol || '';
   if (els.graphModelInput.value !== (config.model || '')) els.graphModelInput.value = config.model || '';
   if (els.graphBaseUrlInput.value !== (config.baseUrl || '')) els.graphBaseUrlInput.value = config.baseUrl || '';
-  els.buildGraphBtn.querySelector('span:last-child')!.textContent = hasGraph ? '更新' : '构建';
+  els.buildGraphBtn.querySelector('span:last-child')!.textContent = hasGraph ? 'Update' : 'Build';
   els.graphLeftActions.classList.toggle('has-graph', hasGraph);
   els.buildGraphBtn.disabled = running || !knowledgeEnabled;
   els.rebuildGraphBtn.hidden = !hasGraph;
@@ -2179,11 +2685,11 @@ function hasKnowledgeGraph(graph: JsonMap | null | undefined) {
 function renderKnowledgeWorkbench(data: Bootstrap) {
   const summary = data.knowledgeBaseSummary || data.knowledgeGraph?.summary || {};
   els.knowledgeSummary.innerHTML = `
-    <div class="knowledge-depth">深度 ${escapeHtml(summary.extractionDepth ?? data.runtimeSettings?.knowledgeGraphExtractionDepth ?? 2)}</div>
-    ${knowledgeStatHtml('knowledge', summary.knowledgeCount ?? 0, '知识')}
-    ${knowledgeStatHtml('evidence', summary.evidenceCount ?? 0, '证据')}
-    ${knowledgeStatHtml('classes', summary.classCount ?? 0, '概念')}
-    ${knowledgeStatHtml('relations', summary.relationCount ?? 0, '关系')}
+    <div class="knowledge-depth">Depth ${escapeHtml(summary.extractionDepth ?? data.runtimeSettings?.knowledgeGraphExtractionDepth ?? 2)}</div>
+    ${knowledgeStatHtml('knowledge', summary.knowledgeCount ?? 0, 'Knowledge')}
+    ${knowledgeStatHtml('evidence', summary.evidenceCount ?? 0, 'Evidence')}
+    ${knowledgeStatHtml('classes', summary.classCount ?? 0, 'Concepts')}
+    ${knowledgeStatHtml('relations', summary.relationCount ?? 0, 'Relations')}
   `;
   for (const item of els.knowledgeSummary.querySelectorAll<HTMLButtonElement>('[data-kb-kind]')) {
     item.addEventListener('click', async () => {
@@ -2239,9 +2745,9 @@ function renderKnowledgeBaseCards() {
     els.knowledgeCards.innerHTML = `
       <div class="kb-list-head">
         <div class="node-detail-title">${escapeHtml(state.selectedKnowledgeBaseKind)}</div>
-        <button class="icon-btn ghost" type="button" data-kb-close title="关闭"><span data-icon="X"></span></button>
+        <button class="icon-btn ghost" type="button" data-kb-close title="Close"><span data-icon="X"></span></button>
       </div>
-      ${emptyState('正在加载卡片...', 'Loader2')}
+      ${emptyState('Loading cards...', 'Loader2')}
     `;
     bindKnowledgeCardControls();
     return;
@@ -2252,12 +2758,12 @@ function renderKnowledgeBaseCards() {
     <div class="kb-list-head">
       <div>
         <div class="node-detail-title">${escapeHtml(payload.label || state.selectedKnowledgeBaseKind)}</div>
-        <div class="meta">已显示 ${escapeHtml(cards.length)} 条${payload.count ? ` · 共 ${escapeHtml(payload.count)} 条` : ''}</div>
+        <div class="meta">Showing ${escapeHtml(cards.length)}${payload.count ? ` of ${escapeHtml(payload.count)}` : ''}</div>
       </div>
-      <button class="icon-btn ghost" type="button" data-kb-close title="关闭"><span data-icon="X"></span></button>
+      <button class="icon-btn ghost" type="button" data-kb-close title="Close"><span data-icon="X"></span></button>
     </div>
     ${payload.error ? `<div class="empty"><span data-icon="AlertTriangle"></span><span>${escapeHtml(payload.error)}</span></div>` : ''}
-    ${cards.length ? `<div class="kb-cards">${cards.map(knowledgeBaseCardHtml).join('')}</div>` : emptyState('暂无卡片。', 'Info')}
+    ${cards.length ? `<div class="kb-cards">${cards.map(knowledgeBaseCardHtml).join('')}</div>` : emptyState('No cards yet.', 'Info')}
   `;
   bindKnowledgeCardControls();
 }
@@ -2282,7 +2788,7 @@ function knowledgeBaseCardHtml(card: JsonMap) {
   return `
     <article class="kb-card ${previewUrl ? 'clickable' : ''}" ${previewUrl ? `data-preview-url="${escapeHtml(previewUrl)}"` : ''}>
       <div class="kb-card-title">
-        <span>${escapeHtml(card.title || card.id || '卡片')}</span>
+        <span>${escapeHtml(card.title || card.id || 'Card')}</span>
         <span class="meta">${escapeHtml(card.id || '')}</span>
       </div>
       ${card.subtitle ? `<div class="meta">${escapeHtml(card.subtitle)}</div>` : ''}
@@ -2297,7 +2803,7 @@ function renderBuilderTrace(parts: JsonMap[], target: HTMLElement = els.builderT
   const savedScroll = target.scrollTop;
   const visible = normalizeChatParts((parts || []).map((part) => ({ ...part, sourceLabel: 'builder' }))).slice(-80);
   if (!visible.length) {
-    target.innerHTML = emptyState('暂无构建记录。点击“构建”开始。', 'TerminalSquare');
+    target.innerHTML = emptyState('No build history. Select Build to begin.', 'TerminalSquare');
     return;
   }
   target.innerHTML = visible.map((part) => messageHtml(part)).join('');
@@ -2381,11 +2887,11 @@ function renderKnowledgeGraph(graph: JsonMap | null | undefined) {
 
 function graphTitleLabel(graph: JsonMap | null | undefined) {
   const raw = String(graph?.taskGoal || '').trim();
-  if (!raw) return '参考知识';
-  if (raw === 'Knowledge Base') return '参考知识库';
-  if (raw === 'Time-Series Domain Knowledge') return '时间序列领域知识';
-  if (raw === 'Domain Brief: Time-Series Domain Knowledge') return '时间序列领域知识';
-  if (/^Domain Brief:/i.test(raw)) return raw.replace(/^Domain Brief:\s*/i, '').trim() || '参考知识';
+  if (!raw) return 'Reference knowledge';
+  if (raw === 'Knowledge Base') return 'Reference library';
+  if (raw === 'Time-Series Domain Knowledge') return 'Time-series domain knowledge';
+  if (raw === 'Domain Brief: Time-Series Domain Knowledge') return 'Time-series domain knowledge';
+  if (/^Domain Brief:/i.test(raw)) return raw.replace(/^Domain Brief:\s*/i, '').trim() || 'Reference knowledge';
   return raw;
 }
 
@@ -2399,7 +2905,7 @@ function graphEmptyStateHtml(graph: JsonMap | null | undefined) {
         <i></i>
       </div>
       <div class="graph-empty-copy">
-        <div class="graph-empty-title">知识图谱尚未构建</div>
+        <div class="graph-empty-title">Knowledge graph is not built yet</div>
         <p>${escapeHtml(graphEmptyNotes(graph))}</p>
       </div>
     </div>
@@ -2408,9 +2914,9 @@ function graphEmptyStateHtml(graph: JsonMap | null | undefined) {
 
 function graphEmptyNotes(graph: JsonMap | null | undefined) {
   const raw = String(graph?.notes || '').trim();
-  if (!raw) return '点击左侧“构建”后，系统会从参考资料中抽取概念、证据和关系，并在这里生成可浏览的知识网络。';
+  if (!raw) return 'Select Build to extract concepts, evidence, and relations from the references.';
   if (raw === 'CSV knowledge base: evidence, knowledge, class nodes, and relation edges.') {
-    return '当前还没有可展示的概念和关系。点击左侧“构建”开始生成知识网络。';
+    return 'No concepts or relations are available yet. Select Build to create the knowledge graph.';
   }
   return raw;
 }
@@ -2546,11 +3052,11 @@ function graphLabelSelection(
 
 function graphMetadataHtml(graph: JsonMap | null | undefined, nodes: JsonMap[], edges: JsonMap[]) {
   return `
-    <div class="node-detail-title">图谱信息</div>
+    <div class="node-detail-title">Graph details</div>
     <dl class="kv graph-kv">
-      <dt>概念</dt><dd>${nodes.length}</dd>
-      <dt>关系</dt><dd>${edges.length}</dd>
-      <dt>更新时间</dt><dd>${escapeHtml(graph?.updatedAt || '-')}</dd>
+      <dt>Concepts</dt><dd>${nodes.length}</dd>
+      <dt>Relations</dt><dd>${edges.length}</dd>
+      <dt>Updated</dt><dd>${escapeHtml(graph?.updatedAt || '-')}</dd>
     </dl>
   `;
 }
@@ -2560,49 +3066,49 @@ function graphInspectorHtml(graph: JsonMap | null | undefined, selected: JsonMap
   const related = edges.filter((edge) => edge.source === selected.id || edge.target === selected.id);
   return `
     ${graphMetadataHtml(graph, nodes, edges)}
-    <div class="detail-section-title">选中概念</div>
+    <div class="detail-section-title">Selected concept</div>
     <div class="graph-selected">
       <div class="node-detail-title">${escapeHtml(selected.label || selected.id)}</div>
-      <div class="meta">${escapeHtml(selected.type || '概念')} · ${escapeHtml(selected.id || '')}</div>
+      <div class="meta">${escapeHtml(selected.type || 'Concepts')} · ${escapeHtml(selected.id || '')}</div>
       ${classDescriptionHtml(selected.summary || '')}
     </div>
-    <div class="detail-section-title">来源知识</div>
-    ${idListHtml(selected.knowledgeIds || [], '知识')}
-    <div class="detail-section-title">证据</div>
+    <div class="detail-section-title">Source knowledge</div>
+    ${idListHtml(selected.knowledgeIds || [], 'Knowledge')}
+    <div class="detail-section-title">Evidence</div>
     ${graphEvidenceHtml(selected.evidence || [])}
-    <div class="detail-section-title">关系</div>
+    <div class="detail-section-title">Relations</div>
     ${related.length ? `<div class="graph-relations">${related.map((edge) => `
       <div class="graph-relation">
         <div class="timeline-type">${escapeHtml(edge.relation || 'related')}</div>
         <div class="meta">${escapeHtml(edge.sourceLabel || edge.source)} -> ${escapeHtml(edge.targetLabel || edge.target)}</div>
         <div>${escapeHtml(edge.summary || '')}</div>
-        ${edge.knowledgeIds?.length ? idListHtml(edge.knowledgeIds, '知识') : ''}
+        ${edge.knowledgeIds?.length ? idListHtml(edge.knowledgeIds, 'Knowledge') : ''}
       </div>
-    `).join('')}</div>` : emptyState('暂无关联边。', 'GitBranch')}
+    `).join('')}</div>` : emptyState('No connected edges.', 'GitBranch')}
   `;
 }
 
 function idListHtml(items: string[], label: string) {
-  if (!items.length) return emptyState(`暂无相关${label}。`, 'Info');
+  if (!items.length) return emptyState(`No related ${label.toLowerCase()}.`, 'Info');
   return `<div class="graph-mini-list">${items.map((item) => `<span>${escapeHtml(item)}</span>`).join('')}</div>`;
 }
 
 function classDescriptionHtml(summary: string) {
-  if (!summary) return emptyState('暂无描述。', 'Info');
+  if (!summary) return emptyState('No description.', 'Info');
   return `
     <details class="class-description">
-      <summary>描述</summary>
+      <summary>Description</summary>
       <p>${escapeHtml(summary)}</p>
     </details>
   `;
 }
 
 function graphEvidenceHtml(items: JsonMap[]) {
-  if (!items.length) return emptyState('暂无证据。', 'File');
+  if (!items.length) return emptyState('No evidence.', 'File');
   return `<div class="graph-evidence">${items.slice(0, 6).map((item) => `
     <button class="artifact-item evidence-item" type="button" data-path="${escapeHtml(item.sourcePath || '')}" data-preview-url="${escapeHtml(item.previewUrl || '')}">
       <span data-icon="File"></span>
-      <span>${escapeHtml(item.sourcePath || '来源')}: ${escapeHtml(item.quote || item.summary || '')}</span>
+      <span>${escapeHtml(item.sourcePath || 'Source')}: ${escapeHtml(item.quote || item.summary || '')}</span>
     </button>
   `).join('')}</div>`;
 }
@@ -2619,7 +3125,7 @@ function messageHtml(part: JsonMap) {
   if (part.type === 'loading') {
     return `
       <article class="message assistant loading">
-        <div class="message-role"><span data-icon="Loader2"></span>${escapeHtml(source)}助手 · 运行中 · ${formatTime(part.timestamp)}</div>
+        <div class="message-role"><span data-icon="Loader2"></span>${escapeHtml(source)}Assistant · Running · ${formatTime(part.timestamp)}</div>
         <div class="message-text loading-line"><span>${escapeHtml(part.text)}</span></div>
       </article>
     `;
@@ -2657,7 +3163,7 @@ function messageHtml(part: JsonMap) {
 function toolSummary(part: JsonMap) {
   if (part.type === 'tool_call') {
     const intend = typeof part.intend === 'string' && part.intend.trim() ? part.intend.trim() : '';
-    return intend || `调用工具：${toolNameForPart(part)}`;
+    return intend || `Call tool: ${toolNameForPart(part)}`;
   }
   if (part.type === 'tool_use') {
     const name = part.name || part.raw?.message?.content?.find?.((block: JsonMap) => block.type === 'tool_use')?.name || 'tool';
@@ -2665,29 +3171,29 @@ function toolSummary(part: JsonMap) {
     const intend = input?.intend;
     if (typeof intend === 'string' && intend.trim()) return intend.trim();
     const hint = input && typeof input === 'object' ? Object.keys(input).slice(0, 3).join(', ') : '';
-    return hint ? `调用工具：${name} (${hint})` : `调用工具：${name}`;
+    return hint ? `Call tool: ${name} (${hint})` : `Call tool: ${name}`;
   }
   const text = part.displayText || part.text || '';
-  const firstLine = text.split('\n').find((line: string) => line.trim()) || '工具结果';
+  const firstLine = text.split('\n').find((line: string) => line.trim()) || 'Tool result';
   return firstLine.length > 120 ? `${firstLine.slice(0, 117)}...` : firstLine;
 }
 
 function toolDetail(part: JsonMap) {
   if (part.type === 'tool_call') {
     const chunks = [
-      `工具：${toolNameForPart(part)}`,
-      `状态：${statusLabel(part.status || 'pending')}`,
+      `Tool: ${toolNameForPart(part)}`,
+      `Status: ${statusLabel(part.status || 'pending')}`,
       '',
-      '调用意图:',
+      'Purpose:',
       part.intend || '',
       '',
-      '调用参数:',
+      'Arguments:',
       JSON.stringify(part.input ?? {}, null, 2),
     ];
     if (part.status === 'completed' || part.resultText || part.resultRaw) {
-      chunks.push('', '调用结果:', part.resultText || toolResultTextFromRaw(part.resultRaw) || summarizeRaw(part.resultRaw) || '');
+      chunks.push('', 'Result:', part.resultText || toolResultTextFromRaw(part.resultRaw) || summarizeRaw(part.resultRaw) || '');
     } else {
-      chunks.push('', '调用结果:', '等待工具返回结果。');
+      chunks.push('', 'Result:', 'Waiting for tool result.');
     }
     return chunks.join('\n');
   }
@@ -2792,12 +3298,12 @@ function isDisplayableSessionPart(part: JsonMap): boolean {
 
 function protocolFailureText(part: JsonMap): string {
   const dshError = dshToolResultFailureText(part.raw);
-  if (dshError) return `工具执行失败：${dshError}`;
+  if (dshError) return `Tool failed: ${dshError}`;
   const toolPart = part.type === 'tool_use' || part.type === 'tool_result';
   const failed = part.status === 'failed' || part.raw?.is_error === true || part.raw?.isError === true;
   if (!toolPart || !failed) return '';
   const detail = String(part.resultText || toolResultTextFromRaw(part.raw) || part.text || '').trim();
-  return detail ? `工具执行失败：${detail}` : '工具执行失败。';
+  return detail ? `Tool failed: ${detail}` : 'Tool failed.';
 }
 
 function dshToolResultFailureText(raw: any): string {
@@ -2806,7 +3312,7 @@ function dshToolResultFailureText(raw: any): string {
   if (!Array.isArray(content)) return '';
   const failure = content.find((item: JsonMap) => item?.type === 'tool-result' && item.isError === true);
   if (!failure) return '';
-  return dshContentText(failure.content) || '未提供错误详情。';
+  return dshContentText(failure.content) || 'No error details available.';
 }
 
 function dshContentText(content: any): string {
@@ -2843,21 +3349,21 @@ function isReasoningOnlyPart(part: JsonMap): boolean {
 }
 
 function displayTextForPart(part: JsonMap) {
-  if (part.type === 'loading') return part.text || '运行中';
+  if (part.type === 'loading') return part.text || 'Running';
   if (part.type === 'tool_call') {
-    return part.intend || `调用工具：${toolNameForPart(part)}`;
+    return part.intend || `Call tool: ${toolNameForPart(part)}`;
   }
   if (part.type === 'tool_use') {
     const name = part.name || part.raw?.message?.content?.find?.((block: JsonMap) => block.type === 'tool_use')?.name || 'tool';
     const input = part.input || part.raw?.message?.content?.find?.((block: JsonMap) => block.type === 'tool_use')?.input;
-    return input ? `调用工具：${name}\n${JSON.stringify(input, null, 2)}` : `调用工具：${name}`;
+    return input ? `Call tool: ${name}\n${JSON.stringify(input, null, 2)}` : `Call tool: ${name}`;
   }
   if (part.type === 'tool_result') {
     const result = part.raw?.tool_use_result;
     if (result?.filenames) {
       const files = result.filenames.slice(0, 20).join('\n');
       const more = result.truncated ? `\n... (${result.numFiles} files total)` : '';
-      return result.filenames.length ? `工具结果：\n${files}${more}` : '工具结果：未找到文件';
+      return result.filenames.length ? `Tool result:\n${files}${more}` : 'Tool result: No files found';
     }
     const rawText = toolResultTextFromRaw(part.raw);
     if (rawText) return rawText;
@@ -2869,7 +3375,7 @@ function displayTextForPart(part: JsonMap) {
     return subtype;
   }
   if (part.role === 'system' && part.type === 'result') {
-    if (part.raw?.is_error) return part.raw?.result || part.text || '错误';
+    if (part.raw?.is_error) return part.raw?.result || part.text || 'Error';
     return '';
   }
   return part.text || '';
@@ -2878,7 +3384,7 @@ function displayTextForPart(part: JsonMap) {
 function renderTimeline(events: JsonMap[]) {
   const savedScroll = els.timeline.scrollTop;
   if (!events.length) {
-    els.timeline.innerHTML = emptyState('暂无流程记录。', 'Clock3');
+    els.timeline.innerHTML = emptyState('No workflow history.', 'Clock3');
     return;
   }
   els.timeline.innerHTML = events.slice(-80).reverse().map((event) => `
@@ -2895,22 +3401,32 @@ function renderTimeline(events: JsonMap[]) {
 }
 
 function renderFileTree(fileTree: Bootstrap['fileTree']) {
+  renderWorkspaceDatasetControl();
   if (!fileTree?.tree) {
     els.workspacePath.textContent = '';
-    els.fileTree.innerHTML = emptyState('暂无工作区文件。', 'FolderTree');
+    els.fileTree.innerHTML = emptyState('No workspace files.', 'FolderTree');
     return;
   }
   els.workspacePath.textContent = fileTree.root || '';
   els.fileTree.innerHTML = renderTreeNode(fileTree.tree, true);
   if (fileTree.truncated) {
     const limit = fileTree.maxChildrenPerDir
-      ? `（每个目录最多 ${fileTree.maxChildrenPerDir} 项，最多 ${fileTree.maxDepth || 5} 层）`
+      ? `(up to ${fileTree.maxChildrenPerDir} items per folder, ${fileTree.maxDepth || 5} levels)`
       : '';
-    els.fileTree.insertAdjacentHTML('beforeend', emptyState(`部分目录已截断显示${limit}。`, 'AlertTriangle'));
+    els.fileTree.insertAdjacentHTML('beforeend', emptyState(`Some folders are truncated${limit}.`, 'AlertTriangle'));
   }
   for (const item of els.fileTree.querySelectorAll<HTMLElement>('.file-node.file')) {
     item.addEventListener('click', async () => showWorkspaceFile(item.dataset.path || ''));
   }
+}
+
+function renderWorkspaceDatasetControl() {
+  if (!els.workspaceDatasetSelect) return;
+  els.workspaceDatasetSelect.innerHTML = state.ecgDatasets.map((dataset: JsonMap) => {
+    return `<option value="${escapeHtml(dataset.key)}">${escapeHtml(dataset.name || dataset.key)}</option>`;
+  }).join('');
+  if (state.ecgDatasetKey) els.workspaceDatasetSelect.value = state.ecgDatasetKey;
+  els.workspaceDatasetSelect.disabled = state.ecgDatasets.length <= 1;
 }
 
 function renderTreeNode(node: FileTreeNode | undefined, root = false): string {
@@ -2922,7 +3438,7 @@ function renderTreeNode(node: FileTreeNode | undefined, root = false): string {
       : '';
     return `
       <details class="file-dir" ${open ? 'open' : ''}>
-        <summary><span data-icon="ChevronRight"></span><span>${escapeHtml(node.name || '工作区')}</span></summary>
+        <summary><span data-icon="ChevronRight"></span><span>${escapeHtml(node.name || 'Workspace')}</span></summary>
         <div class="file-children">
           ${(node.children || []).map((child) => renderTreeNode(child)).join('')}
           ${truncation}
@@ -2940,9 +3456,9 @@ function renderTreeNode(node: FileTreeNode | undefined, root = false): string {
 
 function fileTreeTruncationText(node: FileTreeNode) {
   if ((node.childCount || 0) > (node.maxChildren || 0)) {
-    return `已显示前 ${node.maxChildren} / ${node.childCount} 项`;
+    return `Showing first ${node.maxChildren} of ${node.childCount} items`;
   }
-  return `已达到 ${node.maxDepth || 5} 层显示深度`;
+  return `Maximum display depth: ${node.maxDepth || 5} levels`;
 }
 
 async function showWorkspaceFile(path: string) {
@@ -2974,8 +3490,8 @@ function updateControls(data: Bootstrap) {
   els.sendBtn.disabled = state.busy || (Boolean(ws.activeNode) && !activePaused);
   els.messageInput.disabled = state.busy || (Boolean(ws.activeNode) && !activePaused);
   els.messageInput.placeholder = activePaused
-    ? '补充说明后点击 Resume，当前 node 会继续执行'
-    : '向任务编排器发送消息';
+    ? 'Add a clarification, then select Resume to continue the current stage'
+    : 'Message the task orchestrator';
   els.interruptBtn.disabled = pauseWaiting || (!state.busy && !activeRunning);
   els.interruptBtn.hidden = !state.busy && !activeRunning;
   els.forceStopBtn.hidden = executionPhase !== 'pausing';
@@ -2998,7 +3514,7 @@ async function runAction(fn: () => Promise<void>) {
   try {
     await fn();
   } catch (error) {
-    showDetail('错误', { message: error instanceof Error ? error.message : String(error) });
+    showDetail('Error', { message: error instanceof Error ? error.message : String(error) });
   } finally {
     state.busy = false;
     render();
@@ -3015,7 +3531,7 @@ async function runStreamingAction(fn: () => Promise<void>) {
     state.busy = false;
     state.loadingMessage = null;
     render();
-    showDetail('错误', { message: error instanceof Error ? error.message : String(error) });
+    showDetail('Error', { message: error instanceof Error ? error.message : String(error) });
   }
 }
 
@@ -3037,29 +3553,29 @@ function variantPill(variant: JsonMap | null | undefined) {
   const id = String(variant.id).toUpperCase();
   const label = `${id} · ${variantNameLabel(variant)}`;
   const isDefault = id === 'NOD-KGR-KTL-CRV-SUB-ADA';
-  const features = Array.isArray(variant.features) ? `功能：${variant.features.join(', ')}` : '';
+  const features = Array.isArray(variant.features) ? `Features: ${variant.features.join(', ')}` : '';
   const title = [variant.description || label, features].filter(Boolean).join('\n');
   return `<span class="mini-pill variant-pill ${isDefault ? 'variant-default' : 'variant-ablation'}" title="${escapeHtml(title)}">${escapeHtml(label)}</span>`;
 }
 
 function variantNameLabel(variant: JsonMap) {
   const id = String(variant.id || '').toUpperCase();
-  if (id === 'NOD-KGR-KTL-CRV-SUB-ADA') return '完整流程';
-  return String(variant.name || '未命名流程');
+  if (id === 'NOD-KGR-KTL-CRV-SUB-ADA') return 'Full workflow';
+  return String(variant.name || 'Unnamed workflow');
 }
 
 function formatRuntimeUv(runtimeUv: JsonMap | null | undefined) {
   if (!runtimeUv) return '-';
   const runtimeState = runtimeUv.state || 'unknown';
-  if (runtimeState === 'ready') return `就绪 · Python ${runtimeUv.pythonVersion || ''}`.trim();
-  if (runtimeState === 'skipped') return '已跳过';
-  if (runtimeState === 'failed') return '失败';
+  if (runtimeState === 'ready') return `Ready · Python ${runtimeUv.pythonVersion || ''}`.trim();
+  if (runtimeState === 'skipped') return 'Skipped';
+  if (runtimeState === 'failed') return 'Failed';
   return runtimeState;
 }
 
 function runtimePill(runtimeUv: JsonMap | null | undefined) {
   const text = formatRuntimeUv(runtimeUv);
-  const tone = text.startsWith('就绪') ? 'ready' : text === '失败' ? 'failed' : 'pending';
+  const tone = text.startsWith('Ready') ? 'ready' : text === 'Failed' ? 'failed' : 'pending';
   return `<span class="mini-pill ${tone}">${escapeHtml(text)}</span>`;
 }
 
@@ -3074,89 +3590,89 @@ function statusIcon(status: string) {
 
 function statusLabel(status: any) {
   const value = String(status || 'idle');
-  if (value === 'done' || value === 'completed' || value === 'ready') return '已完成';
-  if (value === 'active' || value === 'running' || value === 'building') return '运行中';
-  if (value === 'failed') return '失败';
-  if (value === 'paused') return '已暂停';
-  if (value === 'waiting_approval') return '等待确认';
-  if (value === 'pending') return '待执行';
-  if (value === 'idle') return '空闲';
+  if (value === 'done' || value === 'completed' || value === 'ready') return 'Complete';
+  if (value === 'active' || value === 'running' || value === 'building') return 'Running';
+  if (value === 'failed') return 'Failed';
+  if (value === 'paused') return 'Paused';
+  if (value === 'waiting_approval') return 'Awaiting approval';
+  if (value === 'pending') return 'Pending';
+  if (value === 'idle') return 'Idle';
   return value;
 }
 
 function modeLabel(mode: any) {
   const value = String(mode || '-');
-  if (value === 'auto') return '自动';
-  if (value === 'manual') return '手动';
+  if (value === 'auto') return 'Auto';
+  if (value === 'manual') return 'Manual';
   return value;
 }
 
 function graphBuildMessage(message: string) {
   if (!message) return '';
-  if (message === 'Knowledge graph updated.') return '知识图谱已更新。';
+  if (message === 'Knowledge graph updated.') return 'Knowledge graph updated.';
   return message;
 }
 
 function chainSummaryBuildMessage(message: string) {
   if (!message) return '';
-  if (message === 'Chain summary updated.') return '思维链总结已更新。';
+  if (message === 'Chain summary updated.') return 'Workflow summary updated.';
   return message;
 }
 
 function nodeDisplayName(type: any) {
   const value = String(type || '');
-  if (value === 'problem-contract') return '问题定义';
-  if (value === 'knowledge-to-tools') return '知识转工具';
-  if (value === 'iterative-solving') return '迭代求解';
-  if (value === 'final-summary') return '最终总结';
+  if (value === 'problem-contract') return 'Problem definition';
+  if (value === 'knowledge-to-tools') return 'Knowledge to tools';
+  if (value === 'iterative-solving') return 'Iterative solving';
+  if (value === 'final-summary') return 'Final summary';
   return value;
 }
 
 function nodePurposeText(spec: JsonMap) {
   const type = String(spec?.type || '');
-  if (type === 'problem-contract') return '根据用户输入和参考资料获取并处理数据，通过数据探索明确当前要解决的问题，并给出整个流程的问题契约。';
-  if (type === 'knowledge-to-tools') return '在主会话中，根据问题契约、数据规范、参考资料目录以及知识图谱（若已构建），生成并校验确定性的参考特征提取器，作为后续案例复盘的数值证据来源。';
-  if (type === 'iterative-solving') return '根据任务契约每轮提出多个候选方案，分别做可行性测试与案例复盘，再综合证据选择本轮执行对象或下一轮优化方向。';
-  if (type === 'final-summary') return '当迭代优化结束后，总结整个优化历程、最终工具使用方案、最终结果和系统边界。';
+  if (type === 'problem-contract') return 'Explore the data and references, define the task, and record the evaluation contract.';
+  if (type === 'knowledge-to-tools') return 'Build and validate deterministic reference feature extractors for case review.';
+  if (type === 'iterative-solving') return 'Propose, test, and review candidates in each iteration before selecting the next action.';
+  if (type === 'final-summary') return 'Summarize the experiments, selected tools, results, and limitations.';
   return String(spec?.purpose || '');
 }
 
 function nodePhaseLabel(phase: any) {
   const value = String(phase || '');
-  if (value === 'setup') return '准备';
-  if (value === 'solve') return '求解';
-  if (value === 'iteration') return '迭代';
-  if (value === 'summary') return '总结';
+  if (value === 'setup') return 'Setup';
+  if (value === 'solve') return 'Solve';
+  if (value === 'iteration') return 'Iteration';
+  if (value === 'summary') return 'Summary';
   return value;
 }
 
 function roleLabel(role: any) {
   const value = String(role || '');
-  if (value === 'user') return '用户';
-  if (value === 'assistant') return '助手';
-  if (value === 'system') return '系统';
+  if (value === 'user') return 'User';
+  if (value === 'assistant') return 'Assistant';
+  if (value === 'system') return 'System';
   return value;
 }
 
 function partTypeLabel(type: any) {
   const value = String(type || '');
-  if (value === 'text') return '文本';
-  if (value === 'tool_call') return '工具调用';
-  if (value === 'tool_use') return '工具使用';
-  if (value === 'tool_result') return '工具结果';
-  if (value === 'tool') return '工具';
-  if (value === 'loading') return '运行中';
-  if (value === 'raw') return '原始事件';
-  if (value === 'result') return '结果';
+  if (value === 'text') return 'Text';
+  if (value === 'tool_call') return 'Tool call';
+  if (value === 'tool_use') return 'Tool use';
+  if (value === 'tool_result') return 'Tool result';
+  if (value === 'tool') return 'Tool';
+  if (value === 'loading') return 'Running';
+  if (value === 'raw') return 'Raw event';
+  if (value === 'result') return 'Result';
   return value;
 }
 
 function sourceLabel(source: any) {
   const value = String(source || '');
-  if (value === 'main') return '主会话';
-  if (value === 'builder') return '构建器';
-  if (value === 'harness') return '系统';
-  if (value.startsWith('node:')) return `节点：${nodeDisplayName(value.slice(5))}`;
+  if (value === 'main') return 'Main session';
+  if (value === 'builder') return 'Builder';
+  if (value === 'harness') return 'System';
+  if (value.startsWith('node:')) return `Stage: ${nodeDisplayName(value.slice(5))}`;
   return value;
 }
 
@@ -3192,8 +3708,8 @@ function bindToolCards(root: HTMLElement = els.chatStream) {
 function renderShellState() {
   document.body.classList.toggle('left-collapsed', state.leftCollapsed);
   document.body.classList.toggle('right-collapsed', state.rightCollapsed);
-  els.leftRailToggle.title = state.leftCollapsed ? '展开左栏' : '折叠左栏';
-  els.rightRailToggle.title = state.rightCollapsed ? '展开右栏' : '折叠右栏';
+  els.leftRailToggle.title = state.leftCollapsed ? 'Expand left sidebar' : 'Collapse left sidebar';
+  els.rightRailToggle.title = state.rightCollapsed ? 'Expand right sidebar' : 'Collapse right sidebar';
   const leftIcon = state.leftCollapsed ? 'ChevronRight' : 'ChevronLeft';
   const rightIcon = state.rightCollapsed ? 'ChevronLeft' : 'ChevronRight';
   if (els.leftRailToggle.dataset.currentIcon !== leftIcon) {
@@ -3225,7 +3741,7 @@ function updateSendButton(activePaused = false) {
     els.sendBtn.innerHTML = `<span data-icon="${icon}"></span>`;
     hydrateIcons(els.sendBtn);
   }
-  els.sendBtn.title = activePaused ? '继续当前节点' : '发送';
+  els.sendBtn.title = activePaused ? 'Resume current stage' : 'Send';
   els.sendBtn.classList.toggle('ready', canSend);
 }
 
@@ -3248,7 +3764,7 @@ async function pauseCurrent(reason: string) {
   els.interruptBtn.disabled = true;
   try {
     await postJson('/api/execution/pause', { reason });
-    state.loadingMessage = loadingPart('正在安全暂停并写入 DSH checkpoint');
+    state.loadingMessage = loadingPart('Pausing and saving a checkpoint');
     render();
     const settled = await waitForRealtimeState((data) => ['paused', 'failed'].includes(data.execution?.phase || ''));
     if (settled.execution?.phase === 'failed') {
@@ -3260,7 +3776,7 @@ async function pauseCurrent(reason: string) {
   } catch (error) {
     state.loadingMessage = null;
     render();
-    showDetail('暂停失败', { message: error instanceof Error ? error.message : String(error) });
+    showDetail('Pause failed', { message: error instanceof Error ? error.message : String(error) });
   } finally {
     els.interruptBtn.disabled = false;
     updateControls(state.bootstrap || emptyBootstrap());
@@ -3276,7 +3792,7 @@ async function postSend(text: string): Promise<any> {
       lastError = error;
       const message = error instanceof Error ? error.message : String(error);
       if (!isPausedResumeSettling(message)) break;
-      state.loadingMessage = loadingPart('暂停恢复中，正在重试发送');
+      state.loadingMessage = loadingPart('Resuming; retrying message');
       try {
         await waitForRealtimeState((data) => !data.runtime?.running, 2500);
       } catch {
@@ -3476,3 +3992,6 @@ function createIcon(iconNode: IconNode) {
 }
 
 connectRealtimeEvents();
+if (state.view === 'ecgSamples') void loadEcgOverview();
+else if (state.view === 'patient') void loadPatientOverview();
+else void loadEcgDatasets();

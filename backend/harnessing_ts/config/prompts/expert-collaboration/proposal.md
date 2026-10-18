@@ -1,0 +1,3 @@
+Return {response: string addressing the user's concern and actual findings, draftNote: string with observations and uncertainty, unresolved: string[], nextChecks: string[] of specific questions the user can ask next, featureNames: string[] of supplied measurement names used in the draft}.
+Reference measurements by their supplied names. If results are unchanged, say so; do not manufacture improvement. If the objection needs a missing tool or metadata, name it explicitly.
+Do not select diagnosis labels for the user. A rejected prior suggestion is not an accepted conclusion. Explain what changed from the previous suggestion or why no supported change is warranted.

@@ -6,6 +6,7 @@ import mimetypes
 import os
 import socket
 import sys
+import logging
 from typing import Any, Literal
 from urllib.parse import unquote
 
@@ -13,12 +14,22 @@ import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from harnessing_ts.api.payloads import build_bootstrap_payload, build_live_payload, masked_llm_config
 from harnessing_ts.api.realtime import RealtimeEvent, RealtimeEventBroker
+from harnessing_ts.ecg_demo import (
+    EcgDemoUnavailable,
+    build_ecg_overview,
+    list_ecg_datasets,
+    load_ecg_waveform,
+    resolve_ecg_workspace,
+)
+from harnessing_ts.patient_qa import answer_patient_question
+from harnessing_ts.demo_interactions import create_demo_router
 from harnessing_ts.orchestrator import HarnessOrchestrator
 from harnessing_ts.paths import default_workspace_path, frontend_root
+from harnessing_ts.settings.llm import read_effective_llm_config
 from harnessing_ts.variants import resolve_variant, variant_help_text
 
 
@@ -92,6 +103,19 @@ class KnowledgeQueryRequest(BaseModel):
     includeEvidence: bool = False
 
 
+class PatientQaTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    text: str = Field(max_length=1000)
+
+
+class PatientQaRequest(BaseModel):
+    dataset: Literal["ptbxl", "georgia", "cpsc"]
+    ecgId: int = Field(gt=0)
+    question: str = Field(min_length=1, max_length=300)
+    history: list[PatientQaTurn] = Field(default_factory=list, max_length=6)
+    reviewLabels: list[Literal["NORM", "MI", "STTC", "CD", "HYP"]] = Field(default_factory=list, max_length=5)
+
+
 class DshMcpControlRequest(BaseModel):
     workspace: str
     role: str
@@ -129,6 +153,7 @@ def create_app() -> FastAPI:
                 await orchestrator.close()
 
     app = FastAPI(title="HarnessingTS", lifespan=lifespan)
+    app.include_router(create_demo_router(workspace_path))
     realtime = RealtimeEventBroker()
     orchestrator.set_realtime_event_sink(realtime.publish)
     app.state.orchestrator = orchestrator
@@ -401,6 +426,65 @@ def create_app() -> FastAPI:
     async def file_tree() -> dict[str, Any]:
         return orchestrator.get_file_tree()
 
+    @app.get("/api/ecg/overview")
+    async def ecg_overview(
+        status: Literal["all", "errors", "correct"] = "errors",
+        label: Literal["NORM", "MI", "STTC", "CD", "HYP"] | None = None,
+        limit: int = 80,
+        dataset: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            selected_workspace = resolve_ecg_workspace(workspace_path, dataset)
+            return build_ecg_overview(
+                selected_workspace,
+                status=status,
+                label=label,
+                limit=limit,
+                dataset_key=dataset or "ptbxl",
+            )
+        except EcgDemoUnavailable as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/ecg/datasets")
+    async def ecg_datasets() -> dict[str, Any]:
+        try:
+            return list_ecg_datasets(workspace_path)
+        except EcgDemoUnavailable as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/ecg/patient-qa")
+    async def patient_qa(request: PatientQaRequest) -> dict[str, str]:
+        if not request.question.strip():
+            raise HTTPException(status_code=400, detail="Question cannot be blank.")
+        try:
+            selected_workspace = resolve_ecg_workspace(workspace_path, request.dataset)
+            overview = build_ecg_overview(
+                selected_workspace, status="all", limit=1, ecg_id=request.ecgId,
+            )
+        except EcgDemoUnavailable as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not overview["samples"]:
+            raise HTTPException(status_code=404, detail="ECG case not found in the current validation results.")
+        try:
+            return await answer_patient_question(
+                question=request.question.strip(),
+                sample=overview["samples"][0],
+                history=[turn.model_dump() for turn in request.history],
+                llm_config=read_effective_llm_config(workspace_path),
+                review_labels=request.reviewLabels,
+            )
+        except Exception:
+            logging.getLogger(__name__).exception("Patient Q&A model call failed")
+            raise HTTPException(status_code=503, detail="The AI answer is unavailable. Please try again later.") from None
+
+    @app.get("/api/ecg/samples/{ecg_id}/waveform")
+    async def ecg_waveform(ecg_id: int, dataset: str | None = None) -> dict[str, Any]:
+        try:
+            selected_workspace = resolve_ecg_workspace(workspace_path, dataset)
+            return load_ecg_waveform(selected_workspace, ecg_id)
+        except EcgDemoUnavailable as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.get("/api/files/content")
     async def file_content(path: str) -> dict[str, Any]:
         try:
@@ -576,7 +660,7 @@ def create_app() -> FastAPI:
 
         @app.get("/{full_path:path}")
         async def static_files(full_path: str) -> FileResponse:
-            target = (web_root / (full_path or "index.html")).resolve()
+            target = (web_root / ("demo.html" if full_path.rstrip("/") == "demo" else full_path or "index.html")).resolve()
             if not str(target).startswith(str(web_root.resolve())):
                 raise HTTPException(status_code=403, detail="Forbidden")
             if target.is_dir():

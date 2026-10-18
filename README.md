@@ -5,6 +5,12 @@ It helps an agent work through a time-series task with references, data explorat
 
 It is not a leaderboard or model-comparison framework. The goal is a structured, auditable problem-solving workflow.
 
+## Interactive ECG demonstration
+
+Open `/demo?role=expert&case=26` for expert collaboration. Ask the assistant for an initial analysis, challenge its evidence, inspect actual checks and revision differences, and accept a suggestion into an editable report draft. Publication remains a separate explicit action. `/demo?role=patient&case=62` opens the patient view of an existing demo report. These public-data examples are not clinically validated reports.
+
+See [Expert collaboration](docs/EXPERT_COLLABORATION.md) for the interaction, supported checks, configuration and limitations. The original Agent workspace remains at `/`.
+
 ## Quick Start
 
 ### 1. Install Prerequisites

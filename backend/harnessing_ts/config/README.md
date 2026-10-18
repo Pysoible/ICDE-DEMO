@@ -82,6 +82,16 @@ Chain builder prompt fragments assembled by `backend/harnessing_ts/prompts/compo
 
 Generation and repair prompts must be changed in these Markdown files rather than embedded in `chain_summary.py`.
 
+### Expert collaboration prompts
+
+`prompts/expert-collaboration/` is loaded directly by `expert_collaboration.py` for the separate ICDE review UI, not by a DSH node:
+
+- `system.md`: evidence boundaries, user feedback handling, language and clinical-demo limitations.
+- `plan.md`: the allowlisted check selection JSON contract.
+- `proposal.md`: response, editable note, unresolved questions and evidence-name JSON contract.
+
+The model can propose only existing checks; backend capability gates and version checks remain authoritative. Prompt changes must not imply unimplemented measurement, source-search, retraining or publication capabilities.
+
 ## `nodes/<node-type>/`
 
 Each node has its own directory. A node directory must contain exactly these content files:

@@ -4,6 +4,7 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+    rolldownOptions: { input: { main: 'index.html', demo: 'demo.html' } },
   },
   server: {
     proxy: {
