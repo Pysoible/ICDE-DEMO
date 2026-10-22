@@ -59,6 +59,45 @@ def test_invalid_model_plan_and_invented_features_are_rejected(monkeypatch):
         asyncio.run(expert.propose(None,feedback='Check',context={},result={'features':[]},plan=expert.Plan(action='review_evidence',focus='',reason='Check'),checks=[],history=[]))
 
 
+@pytest.mark.parametrize('base,official', [('https://api.deepseek.com/v1', True), ('https://provider.invalid/v1', False)])
+def test_structured_calls_budget_and_provider_specific_thinking(monkeypatch,base,official):
+    real_client=httpx.AsyncClient
+    def handler(request):
+        payload=json.loads(request.content)
+        assert payload['max_tokens']==8192
+        assert payload['response_format']=={'type':'json_object'}
+        assert payload.get('thinking')==({'type':'disabled'} if official else None)
+        return httpx.Response(200,json={'choices':[{'finish_reason':'stop','message':{'content':'{"action":"review_evidence"}'}}]})
+    monkeypatch.setattr(expert.httpx,'AsyncClient',lambda **kwargs:real_client(transport=httpx.MockTransport(handler),**kwargs))
+    config=SimpleNamespace(apiKey='fixture-key',baseUrl=base,model='fixture-model')
+    assert asyncio.run(expert.complete_json(config,[]))=={'action':'review_evidence'}
+
+
+@pytest.mark.parametrize('envelope,expected',[
+    ({'choices':[{'finish_reason':'length','message':{'content':'','reasoning_content':'secret-reasoning'}}]},'output limit'),
+    ({'choices':[{'finish_reason':'length','message':{'content':'{"response":"partial"}'}}]},'output limit'),
+    ({'choices':[{'finish_reason':'stop','message':{'content':None}}]},'empty analysis'),
+    ({'choices':[{'finish_reason':'stop','message':{'content':'not-json-secret'}}]},'invalid analysis format'),
+    ({'choices':[{'finish_reason':'stop','message':{'content':'[]'}}]},'invalid analysis format'),
+    ({'choices':[]},'invalid analysis format'),
+])
+def test_model_output_failures_are_classified_without_leaking_content(monkeypatch,envelope,expected):
+    real_client=httpx.AsyncClient
+    monkeypatch.setattr(expert.httpx,'AsyncClient',lambda **kwargs:real_client(transport=httpx.MockTransport(lambda _:httpx.Response(200,json=envelope)),**kwargs))
+    with pytest.raises(expert.ModelServiceUnavailable,match=expected) as exc:
+        asyncio.run(expert.complete_json(SimpleNamespace(apiKey='fixture-key',baseUrl='https://provider.invalid',model='fixture'),[]))
+    assert 'secret' not in str(exc.value)
+
+
+def test_timeout_returns_actionable_safe_error(monkeypatch):
+    real_client=httpx.AsyncClient
+    def handler(request):raise httpx.ReadTimeout('secret-provider-details',request=request)
+    monkeypatch.setattr(expert.httpx,'AsyncClient',lambda **kwargs:real_client(transport=httpx.MockTransport(handler),**kwargs))
+    with pytest.raises(expert.ModelServiceUnavailable,match='timed out') as exc:
+        asyncio.run(expert.complete_json(SimpleNamespace(apiKey='fixture-key',baseUrl='https://provider.invalid',model='fixture'),[]))
+    assert 'secret' not in str(exc.value)
+
+
 @pytest.fixture
 def app_fixture(tmp_path,monkeypatch):
     demo._CACHE.clear()

@@ -1,0 +1,30 @@
+.report-workflow{display:flex;gap:8px;flex-wrap:wrap;padding:11px 13px;background:#eef5f2;border:1px solid #dbe8e1;border-radius:7px;margin:14px 0;color:#456c5a;font-size:11px}
+.report-workflow span+span{border-left:1px solid #cbdcd3;padding-left:9px}
+.report-generation{padding:15px;background:#f8faf9;border:1px solid var(--line);border-radius:8px}
+.report-generation>label{font-size:12px;display:block;margin-bottom:7px;font-weight:550}
+.report-generation textarea{min-height:62px;max-height:150px;width:100%;resize:vertical;padding:9px 11px}
+.report-generation .primary{margin:9px 0 7px;width:auto;font-size:12px}
+.report-generation .micro{line-height:1.7}
+.system-report-preview{margin-top:20px}.system-report-preview .panel-heading{align-items:start;gap:10px}
+.system-report-preview h3{font-size:15px}.system-report-body{font-size:14px;line-height:1.9;white-space:pre-wrap;overflow-wrap:anywhere;color:#4b6265;background:#fbfaf7;border-left:3px solid #c8b790;padding:17px;margin:13px 0}
+.report-empty{padding:25px 15px;text-align:center;border:1px dashed #cdded5;border-radius:8px;margin:13px 0;color:#72877f}.report-empty p{font-size:12px;line-height:1.8;margin-top:10px}
+.report-manual-edit summary,.report-basis summary,.report-audit summary{cursor:pointer;font-size:12px;color:var(--accent);padding:10px 0}.report-manual-edit textarea{width:100%;resize:vertical;min-height:150px}
+.report-basis{margin-top:15px;border-top:1px solid var(--line)}.review-editor .report-basis fieldset{margin:12px 0}.report-basis .attached-evidence{padding:8px 0}
+.report-approval-bar{padding:14px 20px;border-top:1px solid var(--line);background:#fff}
+.report-approval{display:flex;align-items:start;gap:9px;font-size:12px;line-height:1.6}.report-approval input{width:auto;flex-shrink:0;accent-color:var(--accent);margin-top:3px}
+.report-approval-bar .review-actions{padding-top:10px;margin:8px 0;border:0;gap:10px;flex-wrap:wrap}.report-approval-bar>.micro{line-height:1.6}
+.report-audit{padding:0 16px;border:1px solid var(--line);border-radius:8px;background:#fff}.report-audit .feedback-snapshot{margin:8px 0}
+.published-change{margin-top:18px;border:1px solid var(--line);border-radius:6px;padding:13px}.published-change h3{font-size:12px}.published-change p{font-size:13px;margin:8px 0}.published-change small{font-size:11px;color:var(--muted);line-height:1.6;display:block}
+@media(min-width:1000px) and (min-height:620px){
+  .panel-review{overflow:hidden;display:flex;flex-direction:column}
+  .patient-report-workspace{flex:1;min-height:0;align-items:stretch;gap:16px;grid-template-columns:minmax(0,1.4fr) minmax(280px,.8fr)}
+  .system-report-editor{padding:0;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+  .report-scroll{min-height:0;flex:1;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;padding:18px 20px}
+  .report-approval-bar{flex-shrink:0}.report-approval-bar .micro{font-size:9px}
+  .patient-report-workspace>.review-side{min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;gap:12px}
+  .patient-report-workspace .publication-panel,.patient-report-workspace .feedback-panel{padding:17px}
+}
+@media(max-width:999px),(max-height:619px){
+  .patient-report-workspace{grid-template-columns:minmax(0,1fr)}
+  .system-report-editor{padding:0}.report-scroll{padding:18px}.report-approval-bar{padding:14px 18px}
+}

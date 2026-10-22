@@ -1,5 +1,13 @@
 # RecursiveECG
 
+### Patient interaction: less boilerplate, visible response
+
+The patient view keeps one public-data/demo badge and removes repeated generic disclaimers. Relevant uncertainty, urgent-care actions and medicine cautions remain. **Add my situation** prepares an editable question; the next answer can show exact user quotes beside the Agent's explanation focus. Quotes are checked against actual user messages, not inferred from ECG labels. Completed report/attachment/version checks are visible above a task finding. These are material checks and explanation changes, not new diagnoses, treatment changes or automatic report updates. Existing reports/tasks retain their original text; send a new question to use the new response format.
+
+### Patient explanation update
+
+In `/demo`, **Understand together** separates a direct answer, what the published material records, a question-specific limitation, and a useful follow-up. “Ask the Agent about this” prepares an editable question; sending is still explicit. The check view separately displays what the Agent actually checked. Original reports and old checks remain unchanged; request a new explanation to use the updated wording. Legacy Demo question clients use the same published-report-only explanation service; the root workbench is unchanged. Explanations do not independently verify medical correctness or replace care.
+
 RecursiveECG is a time-series tool-use harness built on the official Python DeepSeek Harness SDK.
 It helps an agent work through a time-series task with references, data exploration, a problem contract, iterative tool building, evidence review, and a final summary.
 
@@ -7,9 +15,25 @@ It is not a leaderboard or model-comparison framework. The goal is a structured,
 
 ## Interactive ECG demonstration
 
-Open `/demo?role=expert&case=26` for expert collaboration. Ask the assistant for an initial analysis, challenge its evidence, inspect actual checks and revision differences, and accept a suggestion into an editable report draft. Publication remains a separate explicit action. `/demo?role=patient&case=62` opens the patient view of an existing demo report. These public-data examples are not clinically validated reports.
+The patient page defaults to **Check my question**. Ask in everyday words and explicitly choose **Ask Agent to check**. The Agent selects up to three read-only published-material checks and immediately returns findings and limitations, with actual application receipts available separately. **Help me understand this finding** prepares a follow-up with the Agent, without waiting for a doctor reply. This checks published materials, not diagnostic correctness or symptoms; no report/classification changes automatically.
+
+Patients may optionally expand **keep an evidence gap**, edit the suggested check target and explicitly save it. This is a system evidence-check task, not doctor-to-patient chat. In expert tab **05 Report & feedback → Agent-discovered evidence-check tasks**, start it and carry the target into the existing expert-feedback or evidence-investigation workspace. Perform analysis or separately publish a reviewed report; return to 05, select actual work performed after start, confirm its association, and choose **Record review work**. No patient reply is written or published. Saving that work does not publish or change a report and does not certify resolution.
+
+For every saved question, the patient sees a computed comparison against the current published report, including label/text/attachment changes or no change, even if no expert task was submitted. **Recheck my original question** becomes available after a new publication or recorded review work; the Agent checks current published material again, preserving the original check. Professional analysis can remain internal without changing the report, so the Agent may honestly report insufficient information. The comparison does not establish causal influence of the question or diagnostic improvement. This research demo does not provide authenticated clinical accounts, doctor chat, appointments or guaranteed response times. Legacy feedback/replies and existing reports remain intact.
+
+The patient view shows **Report findings** directly below the published-report heading, with each code and localized name visible without expanding technical details. Select a label to prepare an editable explanation question; send explicitly. These are the published report's labels, not reported symptoms or confirmed diagnoses.
+
+Use **中文 / English** at the top right of `/demo` to switch the expert and patient interface language. Your choice is saved in this browser; the first visit follows the browser language. Navigation, controls, hints and measurement display names switch immediately, including while a question is being processed. Unsent questions and review drafts are retained. Saved reports, existing conversations, model responses and original reference text retain their original language. The original `/` Agent workspace has its own interface.
+
+Expert analysis distinguishes quota/credential errors, connection failures, timeouts, empty answers and incomplete output. Your question is retained on failure. The official DeepSeek connection uses non-thinking mode for its bounded JSON planning and analysis requests, with an 8192-token output budget. This prevents default reasoning from consuming the whole answer budget. The configured model and credential are shared with the existing service.
+
+Open `/demo?role=expert&case=49` for expert feedback. Submit an opinion, inspect the tested threshold/criterion and its effects, then refine or confirm. Explicitly using a confirmed result asks RecursiveECG to generate a patient report: the expert does not need to write it. In tab 05, request a simpler explanation or clearer uncertainty, inspect the rewritten text, or optionally edit it directly. Check the review approval box and choose **Approve & publish patient report** to publish. Generation and draft saving never publish; changed assessment/evidence requires regeneration and renewed approval. Expert validation details stay separate from patient-facing prose. `/demo?role=patient&case=62` opens the last published report. Existing reports remain unchanged until an explicit new publication. These public-data examples are not clinically validated reports.
 
 See [Expert collaboration](docs/EXPERT_COLLABORATION.md) for the interaction, supported checks, configuration and limitations. The original Agent workspace remains at `/`.
+
+In tab 05, click the **Assessment and evidence used for generation** heading to expand or collapse the label/evidence selector. Selecting or removing labels and evidence keeps it open and retains the report-panel scroll position. The current case also retains manual-edit/audit expansion while switching tabs or interface language; a different case/source context starts with its own defaults. Changing labels/evidence still invalidates report approval and requires regeneration.
+
+On desktop windows (at least 980 × 600 CSS pixels), the demo fits the viewport: navigation stays visible, conversations and evidence scroll within their panels, and the expert composer and suggestion decisions remain on screen. Smaller windows retain normal page scrolling for readability. Suggested questions and scope details can be expanded when needed.
 
 ## Quick Start
 
@@ -291,3 +315,31 @@ Training support is optional and not needed for normal use.
 uv sync --extra training
 uv run ts-harness training-template
 ```
+# ICDE 专家交互更新（2026-10-19）
+
+**演示指标范围**：专家反馈主卡、候选尝试、变化病例列表、报告页专家摘要与预设场景仅显示调整集和当前病例。页面标注调整集范围；不展示留出集及包含留出样本的全量汇总。既有后台评估与历史记录保留，调整集结果不能解释为独立泛化验证。
+
+### 预设正向交互演示（模拟数据）
+
+打开 `/demo?scenario=positive`。该独立页面以 SIM 编号和固定水印展示预设意见、条件与报告表达，不调用模型或读写真实报告。点击意见 1 / 2 对比条件范围；两组模拟记录的计数和 NORM F1 均从可展开的逐条记录计算。意见 2 在模拟调整组和模拟留出组均有正向变化。此处分组只服务交互展示，不能作为 PTB-XL 研究结果或泛化验证；原始工作台保留真实结果。页面提供返回真实数据工作台的链接。
+
+## 患者理解伙伴（2026-10-20）
+
+患者端新增“症状观察 / 怎么休息 / 用药问题”入口，点击仅准备问题，发送后才调用模型。回答可包含相关症状的一般知识、具体睡眠与休息习惯、药物用途和常见注意事项；不会由报告标签推断患者已有症状或开具个人处方/剂量。普通解释不再强制附免责段落，材料依据放在可展开回执中；必要急症提醒仍直接显示。原报告和旧回答不重写，刷新并重新提问使用新逻辑。
+
+打开 `/demo?role=patient&case=26`，默认使用“核实我的疑问”。患者用自己的话提问，明确发送后 Agent 选择只读核查动作，立即返回发现、局限与实际核查回执，不需要先理解 QRS，也不用等待医生回复。“帮我读懂这次发现”准备与 Agent 的后续解释；若要进一步核查，可展开并编辑“保留一个待核查点”，保存的是系统任务而不是医生聊天消息。专家在 05 页接手后，可使用原反馈分析／证据核查工具，随后关联接手之后实际产生的分析或单独审核发布的新报告，记录核查工作，无需撰写患者答复。患者始终能看到原问题以来的真实已发布版本变化；有新材料或核查工作时可针对原问题重新核查。没有变化、证据仍不足也是有效结果，不证明临床问题已解决，不能宣称反馈导致诊断变正确。原始报告、旧反馈和旧答复全部保留，阈值/模型/报告不自动修改。“一起读懂报告”中保留通俗解释、理解核对和六项临时问题清单；清单可带入 Agent 核查，语言切换不调用模型。公开数据演示不提供问诊、预约或经临床验证的服务。
+
+**2026-10-20：从统计到可追问的病例证据。** 01 页中栏逐项展示当前病例是否命中候选条件；“不符合我的本意，纠正理解”可写入下一轮意见。右栏展示真实调整集的反例、支持例和边界例，点击可在同页切换，不离开当前病例；“请 Agent 结合此病例继续修订”将该病例的真实观察填入输入框，仍由专家明确提交。Agent 每次检验后也会得到调整集例证，下一轮可针对代价或边界继续检验；不保证一定找到更好的条件。反例不是临床相似病例，弱标签一致也不是诊断正确。无推荐时保留最后一次检验的证据，但不能采纳。05 页“报告文字变化”对比当前系统草稿与上次已发布正文，没有旧报告时不编造对照。原预测、已发布报告和旧 `/` 工作台保持不变；切换语言不触发模型。更完整的功能与边界见 [专家协作说明](docs/EXPERT_COLLABORATION.md)。
+
+专家协作页默认采用 **Agent 主动核查**：输入核查目标，Agent 根据实测值与每次检查结果选择下一步，最多三次检查；需要缺失信息时提出具体追问。有候选条件时自动在当前及所选病例上回放，再明确保留候选、暂不推荐或请求补充信息。界面展示真实行动记录、停止原因和回放后再评估；不是展示虚构的“思考过程”。病例选择仍由用户控制，不能把小样本回放当成准确率或临床验证。编辑条件后，之前的 Agent 评估不再适用，须重新验证。专家仍单独决定采纳、编辑草稿与发布；原工作台和已有报告不变。
+
+打开 `http://10.132.80.118:4328/demo?role=expert&case=49`，默认展示“专家意见报告—Agent 调整—反馈前后对比”。输入意见并点击“根据意见调整并重新分析”；点击历史意见卡查看对应条件与影响。确认后将结果用于报告，由系统自动生成患者解释。05 页的“对报告的修改要求（可选）”仅重写表达，不调整判断条件；“将此报告送回判断复核”才会把文字带回 01 页，且仍需明确提交。原有测量、规则、来源检查与最多 8 病例的复核标记回放保留在独立“证据核查”页。长内容在栏内滚动，审核发布操作保持可达；窄屏使用页面滚动。
+
+证据核查建议采纳后，明确选择报告类别，再由系统生成通俗报告。专家可要求 Agent 重写、可选直接编辑，审核后显式发布。患者只读取已发布报告及精简的本病例判断变化；跨病例统计、原始专家假设及阈值推导留在专家端。生成时按当前界面语言撰写，切换语言本身不重新调用模型。边界测试数值不是患者实测值，回放变化不代表诊断或准确率提升；原 `/` 工作台不变。详见 [专家协作说明](docs/EXPERT_COLLABORATION.md)。
+
+**专家意见修订（2026-10-19）**：Agent 在封闭候选空间内（单类阈值，或 1–3 个测量/概率条件增删一个标签）提出标准，确定性计算本病例及验证集的前后变化。原始概率、标签和模型参数永不覆盖；确认记录本病例的新版演示评估，不自动发布或全局部署。每轮相对原始基线评估，不暗中叠加旧条件。验证折按患者分组；当前展示给 Agent 的病例所属患者从留出队列中排除，后续反馈只带入调整集数字。反复查看留出结果后的反馈不等于独立临床验证，不保证任意意见带来改善。显式发布会保存不可变的反馈影响快照，患者只见已发布快照，后续反馈不改旧报告。特征表加载在缓存命中前核验提取器和表/概率/指标/元数据的内容指纹，过期时拒绝使用；首次使用或提示过期时离线重建：`python -m harnessing_ts.revision_loop build --workspace <工作区>`。详见 [专家协作说明](docs/EXPERT_COLLABORATION.md)。
+
+# Patient context-aware explanations
+
+In **Add my situation**, describe symptoms, timing, sleep or medicines. New answers distinguish explicitly reported versus denied symptoms, show the current published report version/findings, and ask one useful missing question. **Add my answer** prepares editable text; it never sends automatically. The Agent may revise its explanation after new context, not a diagnosis or the published report. A mismatch between your description and the selected report is shown explicitly. Old answers remain historical; send a new question to use the updated behavior. Explicit symptom negations no longer trigger an emergency reply by keyword alone; positive/uncertain urgent mentions still take priority. This bounded language check is not clinical triage.
+
